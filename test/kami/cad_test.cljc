@@ -40,6 +40,16 @@
     (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (cad/join-curves [a (cad/move-control-point b 0 [2.1 0 0])] 0.01)))))
 
+(deftest adaptive-curve-measurement-and-bounds
+  (let [w (#?(:clj Math/sqrt :cljs js/Math.sqrt) 0.5)
+        quarter-circle (cad/curve [[1 0 0] [1 1 0] [0 1 0]] [1 w 1])
+        length (cad/curve-length quarter-circle 1.0e-8)
+        box (cad/bounds [[-2 0 1] [3 4 -1] [0 2 5]])]
+    (is (< (#?(:clj Math/abs :cljs js/Math.abs) (- length (/ #?(:clj Math/PI :cljs js/Math.PI) 2))) 1.0e-6))
+    (is (= {:min [-2 0 -1] :max [3 4 5] :size [5 4 6]} box))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cad/curve-length quarter-circle 0)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cad/bounds [])))))
+
 (deftest dimensional-sketch-solver
   (let [sketch (cad/sketch [(cad/sketch-point :a 0 0 true) (cad/sketch-point :b 3 0.4)
                             (cad/sketch-point :c 3.2 2)]

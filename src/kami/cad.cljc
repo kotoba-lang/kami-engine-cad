@@ -54,6 +54,22 @@
 (defn- distance [a b]
   (#?(:clj Math/sqrt :cljs js/Math.sqrt)
    (reduce + (map (fn [x y] (let [d (- x y)] (* d d))) a b))))
+(defn curve-length
+  "Adaptive rational-curve arc length with a world-unit error tolerance."
+  ([c] (curve-length c 1.0e-6))
+  ([c tolerance]
+   (when-not (pos? tolerance) (throw (ex-info "length tolerance must be positive" {:tolerance tolerance})))
+   (letfn [(measure [t0 p0 t1 p1 depth]
+             (let [tm (/ (+ t0 t1) 2.0) pm (evaluate c tm)
+                   chord (distance p0 p1) polygon (+ (distance p0 pm) (distance pm p1))]
+               (if (or (>= depth 24) (<= (- polygon chord) tolerance))
+                 polygon
+                 (+ (measure t0 p0 tm pm (inc depth)) (measure tm pm t1 p1 (inc depth))))))]
+     (measure 0.0 (evaluate c 0.0) 1.0 (evaluate c 1.0) 0))))
+(defn bounds [points]
+  (when-not (seq points) (throw (ex-info "bounds need points" {})))
+  (let [axes (apply map vector points) minima (mapv #(reduce min %) axes) maxima (mapv #(reduce max %) axes)]
+    {:min minima :max maxima :size (mapv - maxima minima)}))
 
 (defn join-curves
   "Join ordered curve spans into a composite curve when adjacent endpoints
