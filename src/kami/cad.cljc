@@ -109,3 +109,74 @@
                              (for [r (range (dec rows)) c (range (dec cols))] [r c])))]
     {:positions positions :indices indices
      :normals (vec (repeat (count positions) [0 0 1]))}))
+
+;; Parametric 2D sketch constraints. Sketch coordinates are f64-compatible
+;; scalar pairs and remain independent from display tessellation.
+(defn sketch-point
+  ([id x y] (sketch-point id x y false))
+  ([id x y fixed?] {:sketch.point/id id :sketch.point/position [x y] :sketch.point/fixed? fixed?}))
+(defn sketch-line [id a b] {:sketch.entity/id id :sketch.entity/kind :line :sketch.entity/a a :sketch.entity/b b})
+(defn constraint [id kind data] (merge {:constraint/id id :constraint/kind kind} data))
+(defn sketch [points entities constraints]
+  {:sketch/points (into {} (map (juxt :sketch.point/id identity) points))
+   :sketch/entities (vec entities) :sketch/constraints (vec constraints)})
+(defn horizontal [id line-id] (constraint id :horizontal {:constraint/entity line-id}))
+(defn vertical [id line-id] (constraint id :vertical {:constraint/entity line-id}))
+(defn coincident [id point-a point-b] (constraint id :coincident {:constraint/a point-a :constraint/b point-b}))
+(defn distance-constraint [id point-a point-b value]
+  (when-not (pos? value) (throw (ex-info "distance constraint must be positive" {:value value})))
+  (constraint id :distance {:constraint/a point-a :constraint/b point-b :constraint/value value}))
+
+(defn- sketch-entity [s id] (first (filter #(= id (:sketch.entity/id %)) (:sketch/entities s))))
+(defn- point-position [s id] (get-in s [:sketch/points id :sketch.point/position]))
+(defn- fixed-point? [s id] (get-in s [:sketch/points id :sketch.point/fixed?]))
+(defn- set-point [s id position]
+  (if (fixed-point? s id) s (assoc-in s [:sketch/points id :sketch.point/position] (vec position))))
+(defn- sqrt-value [x] #?(:clj (Math/sqrt x) :cljs (js/Math.sqrt x)))
+(defn- distance2 [[ax ay] [bx by]] (sqrt-value (+ (* (- bx ax) (- bx ax)) (* (- by ay) (- by ay)))))
+(defn- required-points [c entity]
+  (case (:constraint/kind c)
+    :horizontal [(:sketch.entity/a entity) (:sketch.entity/b entity)]
+    :vertical [(:sketch.entity/a entity) (:sketch.entity/b entity)]
+    [(:constraint/a c) (:constraint/b c)]))
+
+(defn constraint-residual [s c]
+  (let [entity (when-let [id (:constraint/entity c)] (sketch-entity s id))
+        [a b] (required-points c entity) [ax ay] (point-position s a) [bx by] (point-position s b)]
+    (case (:constraint/kind c)
+      :horizontal (#?(:clj Math/abs :cljs js/Math.abs) (- by ay))
+      :vertical (#?(:clj Math/abs :cljs js/Math.abs) (- bx ax))
+      :coincident (distance2 [ax ay] [bx by])
+      :distance (#?(:clj Math/abs :cljs js/Math.abs) (- (distance2 [ax ay] [bx by]) (:constraint/value c)))
+      (throw (ex-info "unknown sketch constraint" {:constraint c})))))
+
+(defn- solve-one [s c]
+  (let [entity (when-let [id (:constraint/entity c)] (sketch-entity s id))
+        [a b] (required-points c entity) pa (point-position s a) pb (point-position s b)
+        fa (fixed-point? s a) fb (fixed-point? s b)
+        place (fn [s target-a target-b]
+                (cond (and fa fb) s fa (set-point s b target-b) fb (set-point s a target-a)
+                      :else (-> s (set-point a target-a) (set-point b target-b))))]
+    (case (:constraint/kind c)
+      :horizontal (let [y (cond fa (second pa) fb (second pb) :else (/ (+ (second pa) (second pb)) 2))]
+                    (place s [(first pa) y] [(first pb) y]))
+      :vertical (let [x (cond fa (first pa) fb (first pb) :else (/ (+ (first pa) (first pb)) 2))]
+                  (place s [x (second pa)] [x (second pb)]))
+      :coincident (let [p (cond fa pa fb pb :else (mapv #(/ (+ %1 %2) 2) pa pb))] (place s p p))
+      :distance (let [d (max 1.0e-12 (distance2 pa pb)) desired (:constraint/value c)
+                      unit (mapv #(/ % d) (mapv - pb pa)) error (- d desired)
+                      da (if fb error (/ error 2)) db (if fa error (/ error 2))]
+                  (place s (mapv + pa (mapv #(* % da) unit))
+                         (mapv - pb (mapv #(* % db) unit))))
+      s)))
+
+(defn solve-sketch
+  ([s] (solve-sketch s {}))
+  ([s {:keys [iterations tolerance] :or {iterations 64 tolerance 1.0e-7}}]
+   (let [solved (loop [current s n 0]
+                  (let [residuals (map #(constraint-residual current %) (:sketch/constraints current))]
+                    (if (or (>= n iterations) (every? #(<= % tolerance) residuals)) current
+                      (recur (reduce solve-one current (:sketch/constraints current)) (inc n)))))
+         residuals (mapv #(constraint-residual solved %) (:sketch/constraints solved))]
+     (assoc solved :sketch/solver {:converged? (every? #(<= % tolerance) residuals)
+                                   :max-residual (reduce max 0 residuals) :residuals residuals}))))
