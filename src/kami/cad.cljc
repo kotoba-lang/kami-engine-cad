@@ -196,3 +196,66 @@
          residuals (mapv #(constraint-residual solved %) (:sketch/constraints solved))]
      (assoc solved :sketch/solver {:converged? (every? #(<= % tolerance) residuals)
                                    :max-residual (reduce max 0 residuals) :residuals residuals}))))
+
+;; Ordered parametric feature history. Features refer only to earlier feature
+;; ids, making rebuild results deterministic and project-file portable.
+(defn feature
+  ([id kind inputs params] (feature id kind inputs params false))
+  ([id kind inputs params suppressed?]
+   {:feature/id id :feature/kind kind :feature/inputs (vec inputs)
+    :feature/params params :feature/suppressed? (boolean suppressed?)}))
+
+(defn feature-model [features]
+  (let [features (vec features) ids (mapv :feature/id features)]
+    (when-not (= (count ids) (count (set ids)))
+      (throw (ex-info "duplicate feature id" {:ids ids})))
+    {:feature-model/features features}))
+
+(defn update-feature [model id f & args]
+  (when-not (some #(= id (:feature/id %)) (:feature-model/features model))
+    (throw (ex-info "feature not found" {:id id})))
+  (update model :feature-model/features
+          #(mapv (fn [feature] (if (= id (:feature/id feature)) (apply f feature args) feature)) %)))
+(defn suppress-feature [model id suppressed?]
+  (update-feature model id assoc :feature/suppressed? (boolean suppressed?)))
+
+(defn- evaluate-feature [feature inputs]
+  (let [p (:feature/params feature)]
+    (case (:feature/kind feature)
+      :source (:value p)
+      :move-control-point (move-control-point (first inputs) (:index p) (:point p))
+      :set-weight (set-weight (first inputs) (:index p) (:weight p))
+      :trim (trim-curve (first inputs) (:t0 p) (:t1 p))
+      :reverse (reverse-curve (first inputs))
+      :join (join-curves inputs (:tolerance p 1.0e-6))
+      :loft (loft inputs (:segments p 32))
+      (throw (ex-info "unsupported CAD feature" {:kind (:feature/kind feature)})))))
+
+(defn recompute-feature-model
+  "Rebuild an ordered feature tree. A failed feature and every dependent
+  feature receive explicit status; independent later branches still rebuild."
+  [model]
+  (loop [remaining (:feature-model/features model) results {} statuses {} seen #{}]
+    (if-let [f (first remaining)]
+      (let [id (:feature/id f) input-ids (:feature/inputs f)
+            missing (seq (remove seen input-ids))
+            failed-input (first (filter #(not= :ok (get-in statuses [% :status])) input-ids))]
+        (cond
+          (:feature/suppressed? f)
+          (recur (rest remaining) results (assoc statuses id {:status :suppressed}) (conj seen id))
+          missing
+          (recur (rest remaining) results
+                 (assoc statuses id {:status :error :reason :input-not-before-feature :inputs (vec missing)}) (conj seen id))
+          failed-input
+          (recur (rest remaining) results
+                 (assoc statuses id {:status :blocked :reason :failed-input :input failed-input}) (conj seen id))
+          :else
+          (let [outcome (try {:value (evaluate-feature f (mapv results input-ids))}
+                             (catch #?(:clj Exception :cljs :default) e
+                               {:error #?(:clj (.getMessage e) :cljs (.-message e))}))]
+            (if-let [message (:error outcome)]
+              (recur (rest remaining) results
+                     (assoc statuses id {:status :error :reason :evaluation-failed :message message}) (conj seen id))
+              (recur (rest remaining) (assoc results id (:value outcome))
+                     (assoc statuses id {:status :ok}) (conj seen id))))))
+      (assoc model :feature-model/results results :feature-model/statuses statuses))))

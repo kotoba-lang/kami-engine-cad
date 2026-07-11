@@ -73,3 +73,33 @@
     (is (true? (get-in solved [:sketch/solver :converged?])))
     (is (false? (get-in impossible [:sketch/solver :converged?])))
     (is (pos? (get-in impossible [:sketch/solver :max-residual])))))
+
+(deftest deterministic-parametric-feature-history
+  (let [base (cad/curve [[0 0 0] [1 2 0] [2 0 0]] [1 1 1])
+        model (cad/feature-model [(cad/feature :sketch :source [] {:value base})
+                                  (cad/feature :move :move-control-point [:sketch] {:index 1 :point [1 4 0]})
+                                  (cad/feature :trim :trim [:move] {:t0 0.25 :t1 0.75})])
+        rebuilt (cad/recompute-feature-model model)
+        edited (-> model (cad/update-feature :move assoc-in [:feature/params :point] [1 6 0])
+                   cad/recompute-feature-model)]
+    (is (= {:sketch {:status :ok} :move {:status :ok} :trim {:status :ok}}
+           (:feature-model/statuses rebuilt)))
+    (is (not= (cad/evaluate (get-in rebuilt [:feature-model/results :trim]) 0.5)
+              (cad/evaluate (get-in edited [:feature-model/results :trim]) 0.5)))
+    (is (= :suppressed (get-in (cad/recompute-feature-model (cad/suppress-feature model :move true))
+                               [:feature-model/statuses :move :status])))
+    (is (= :blocked (get-in (cad/recompute-feature-model (cad/suppress-feature model :move true))
+                            [:feature-model/statuses :trim :status])))))
+
+(deftest feature-history-diagnostics-preserve-independent-branches
+  (let [c (cad/curve [[0 0 0] [1 1 0]] [1 1])
+        model (cad/feature-model [(cad/feature :bad :trim [:later] {:t0 0 :t1 1})
+                                  (cad/feature :independent :source [] {:value c})
+                                  (cad/feature :later :source [] {:value c})])
+        rebuilt (cad/recompute-feature-model model)]
+    (is (= :error (get-in rebuilt [:feature-model/statuses :bad :status])))
+    (is (= :input-not-before-feature (get-in rebuilt [:feature-model/statuses :bad :reason])))
+    (is (= :ok (get-in rebuilt [:feature-model/statuses :independent :status])))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/feature-model [(cad/feature :same :source [] {:value c})
+                                     (cad/feature :same :source [] {:value c})])))))
