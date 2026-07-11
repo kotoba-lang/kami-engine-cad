@@ -219,6 +219,7 @@
 (defn suppress-feature [model id suppressed?]
   (update-feature model id assoc :feature/suppressed? (boolean suppressed?)))
 
+(declare extrude-polygon)
 (defn- evaluate-feature [feature inputs]
   (let [p (:feature/params feature)]
     (case (:feature/kind feature)
@@ -229,6 +230,7 @@
       :reverse (reverse-curve (first inputs))
       :join (join-curves inputs (:tolerance p 1.0e-6))
       :loft (loft inputs (:segments p 32))
+      :extrude (extrude-polygon (first inputs) (:direction p))
       (throw (ex-info "unsupported CAD feature" {:kind (:feature/kind feature)})))))
 
 (defn recompute-feature-model
@@ -259,3 +261,52 @@
               (recur (rest remaining) (assoc results id (:value outcome))
                      (assoc statuses id {:status :ok}) (conj seen id))))))
       (assoc model :feature-model/results results :feature-model/statuses statuses))))
+
+;; Boundary-representation-compatible polygon extrusion. Faces retain their
+;; polygon loops; triangulation is a renderer/export concern.
+(defn solid [vertices faces]
+  {:cad/id (random-uuid) :cad/kind :solid :solid/vertices (mapv vec vertices)
+   :solid/faces (mapv vec faces)})
+(defn solid-edges [s]
+  (->> (:solid/faces s)
+       (mapcat #(map vector % (concat (rest %) [(first %)])))
+       (map #(vec (sort %))) frequencies))
+(defn watertight-solid? [s]
+  (let [vertices (:solid/vertices s) faces (:solid/faces s)]
+    (and (seq vertices) (seq faces)
+         (every? #(and (>= (count %) 3)
+                       (every? (fn [i] (and (integer? i) (<= 0 i (dec (count vertices))))) %)) faces)
+         (every? #(= 2 %) (vals (solid-edges s))))))
+
+(defn extrude-polygon
+  "Extrude a simple planar polygon along vector [dx dy dz] into a closed
+  topological solid. The input loop must have at least three distinct points."
+  [points direction]
+  (when (or (< (count points) 3) (not= (count points) (count (distinct points))))
+    (throw (ex-info "extrusion needs three distinct polygon points" {:points points})))
+  (when (every? zero? direction) (throw (ex-info "extrusion direction cannot be zero" {})))
+  (let [n (count points) top (mapv #(mapv + % direction) points)
+        bottom (vec (reverse (range n))) top-face (vec (range n (* 2 n)))
+        sides (mapv (fn [i] (let [j (mod (inc i) n)] [i j (+ n j) (+ n i)])) (range n))
+        result (solid (into (vec points) top) (vec (concat [bottom top-face] sides)))]
+    (when-not (watertight-solid? result) (throw (ex-info "extrusion produced invalid topology" {})))
+    result))
+
+(defn solid-mesh [s]
+  (when-not (watertight-solid? s) (throw (ex-info "cannot mesh non-watertight solid" {})))
+  (let [triangles (mapcat (fn [face] (map #(vector (first face) (nth face %) (nth face (inc %)))
+                                           (range 1 (dec (count face))))) (:solid/faces s))]
+    {:positions (:solid/vertices s) :indices (vec (mapcat identity triangles))
+     :normals (vec (repeat (count (:solid/vertices s)) [0 0 1]))}))
+
+(defn solid-volume
+  "Signed-tetrahedron volume magnitude for a watertight triangulated solid."
+  [s]
+  (let [{:keys [positions indices]} (solid-mesh s)
+        triple (fn [[ax ay az] [bx by bz] [cx cy cz]]
+                 (+ (* ax (- (* by cz) (* bz cy)))
+                    (* ay (- (* bz cx) (* bx cz)))
+                    (* az (- (* bx cy) (* by cx)))))]
+    (#?(:clj Math/abs :cljs js/Math.abs)
+     (/ (reduce + (map (fn [[a b c]] (triple (nth positions a) (nth positions b) (nth positions c)))
+                       (partition 3 indices))) 6.0))))

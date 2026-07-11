@@ -103,3 +103,22 @@
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (cad/feature-model [(cad/feature :same :source [] {:value c})
                                      (cad/feature :same :source [] {:value c})])))))
+
+(deftest watertight-polygon-extrusion
+  (let [box (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+        mesh (cad/solid-mesh box)]
+    (is (cad/watertight-solid? box))
+    (is (= 8 (count (:solid/vertices box))))
+    (is (= 6 (count (:solid/faces box))))
+    (is (= 12 (count (cad/solid-edges box))))
+    (is (= 36 (count (:indices mesh))))
+    (is (== 24.0 (cad/solid-volume box)))))
+
+(deftest solid-topology-validation
+  (let [open (cad/solid [[0 0 0] [1 0 0] [0 1 0]] [[0 1 2]])]
+    (is (false? (cad/watertight-solid? open)))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (cad/solid-mesh open)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/extrude-polygon [[0 0 0] [1 0 0] [1 0 0]] [0 0 1])))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/extrude-polygon [[0 0 0] [1 0 0] [0 1 0]] [0 0 0])))))
