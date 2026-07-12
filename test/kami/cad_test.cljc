@@ -181,6 +181,65 @@
     (is (= 5 (count polygon)))
     (is (cad/watertight-solid? solid))))
 
+(deftest boolean-intersect-of-overlapping-boxes
+  (let [a (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+        b (cad/extrude-polygon [[2 0 0] [6 0 0] [6 3 0] [2 3 0]] [0 0 2])
+        [result] (cad/boolean-intersect a b)]
+    (is (cad/watertight-solid? result))
+    (is (== 12.0 (cad/solid-volume result)))
+    (is (= #{[2.0 0.0 0.0] [4.0 0.0 0.0] [4.0 3.0 0.0] [2.0 3.0 0.0]
+             [2.0 0.0 2.0] [4.0 0.0 2.0] [4.0 3.0 2.0] [2.0 3.0 2.0]}
+           (set (:solid/vertices result))))
+    (is (empty? (cad/boolean-intersect
+                 a (cad/extrude-polygon [[10 0 0] [14 0 0] [14 3 0] [10 3 0]] [0 0 2]))))))
+
+(deftest boolean-union-of-touching-same-profile-boxes
+  (let [a (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+        b (cad/extrude-polygon [[0 0 2] [4 0 2] [4 3 2] [0 3 2]] [0 0 3])
+        [result] (cad/boolean-union a b)]
+    (is (cad/watertight-solid? result))
+    (is (== 60.0 (cad/solid-volume result)))
+    (let [disjoint (cad/extrude-polygon [[0 0 10] [4 0 10] [4 3 10] [0 3 10]] [0 0 1])
+          results (cad/boolean-union a disjoint)]
+      (is (= 2 (count results)))
+      (is (== 24.0 (cad/solid-volume (first results))))
+      (is (== 12.0 (cad/solid-volume (second results)))))))
+
+(deftest boolean-difference-cuts-a-middle-slab-into-two-solids
+  (let [base (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 5])
+        cut (cad/extrude-polygon [[0 0 2] [4 0 2] [4 3 2] [0 3 2]] [0 0 1])
+        results (cad/boolean-difference base cut)]
+    (is (= 2 (count results)))
+    (is (every? cad/watertight-solid? results))
+    (is (== 24.0 (cad/solid-volume (first results))))
+    (is (== 24.0 (cad/solid-volume (second results))))
+    (is (empty? (cad/boolean-difference base base)))
+    (is (= [base] (cad/boolean-difference
+                   base (cad/extrude-polygon [[0 0 100] [4 0 100] [4 3 100] [0 3 100]] [0 0 1]))))))
+
+(deftest boolean-ops-reject-non-coaxial-and-mismatched-profile-solids
+  (let [z-box (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+        x-box (cad/extrude-polygon [[0 0 0] [0 3 0] [0 3 2] [0 0 2]] [2 0 0])
+        differently-shaped (cad/extrude-polygon [[1 0 0] [5 0 0] [5 3 0] [1 3 0]] [0 0 2])]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cad/boolean-intersect z-box x-box)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cad/boolean-union z-box x-box)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cad/boolean-union z-box differently-shaped)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cad/boolean-difference z-box differently-shaped)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (cad/boolean-intersect z-box (cad/solid [[0 0 0] [1 0 0] [0 1 0]] [[0 1 2]]))))))
+
+(deftest boolean-feature-participates-in-feature-tree
+  (let [model (cad/feature-model
+               [(cad/feature :box-a :source [] {:value (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])})
+                (cad/feature :box-b :source [] {:value (cad/extrude-polygon [[2 0 0] [6 0 0] [6 3 0] [2 3 0]] [0 0 2])})
+                (cad/feature :overlap :boolean-intersect [:box-a :box-b] {})])
+        rebuilt (cad/recompute-feature-model model)
+        results (get-in rebuilt [:feature-model/results :overlap])]
+    (is (= :ok (get-in rebuilt [:feature-model/statuses :overlap :status])))
+    (is (= 1 (count results)))
+    (is (cad/watertight-solid? (first results)))
+    (is (== 12.0 (cad/solid-volume (first results))))))
+
 (deftest fillet-sketch-participates-in-feature-tree
   (let [model (cad/feature-model
                [(cad/feature :sketch :source [] {:value (square-sketch)})
