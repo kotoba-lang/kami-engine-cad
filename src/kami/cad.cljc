@@ -197,6 +197,142 @@
      (assoc solved :sketch/solver {:converged? (every? #(<= % tolerance) residuals)
                                    :max-residual (reduce max 0 residuals) :residuals residuals}))))
 
+;; Sketch-corner fillet/chamfer. Both operate on a straight-line-to-straight-
+;; line corner, trimming the shared vertex back to two tangent points and
+;; splicing in a replacement arc (fillet) or straight cut (chamfer) entity so
+;; the profile stays a single closed loop for `sketch-loop->polygon`.
+(defn sketch-arc [id a b center]
+  {:sketch.entity/id id :sketch.entity/kind :arc :sketch.entity/a a :sketch.entity/b b
+   :sketch.entity/center (vec center)})
+
+(defn- vsub [a b] (mapv - a b))
+(defn- vadd [a b] (mapv + a b))
+(defn- vscale [v k] (mapv #(* % k) v))
+(defn- vlen [v] (sqrt-value (reduce + (map #(* % %) v))))
+(defn- vnorm [v]
+  (let [len (vlen v)]
+    (when (< len 1.0e-9) (throw (ex-info "corner edge has zero length" {:vector v})))
+    (vscale v (/ 1.0 len))))
+(defn- vdot [a b] (reduce + (map * a b)))
+
+(defn- corner-lines
+  "The two straight entities meeting at `corner`: one ending there
+  (`:incoming`), one starting there (`:outgoing`). Anything else (a T-joint,
+  an arc, an unclosed end) is out of scope and rejected."
+  [s corner]
+  (let [touching (filter #(and (= :line (:sketch.entity/kind %))
+                                (or (= corner (:sketch.entity/a %)) (= corner (:sketch.entity/b %))))
+                         (:sketch/entities s))
+        incoming (first (filter #(= corner (:sketch.entity/b %)) touching))
+        outgoing (first (filter #(= corner (:sketch.entity/a %)) touching))]
+    (when-not (and (= 2 (count touching)) incoming outgoing (not= incoming outgoing))
+      (throw (ex-info "fillet/chamfer corner must join exactly one incoming and one outgoing straight line"
+                      {:corner corner :touching (count touching)})))
+    [incoming outgoing]))
+
+(defn- corner-geometry [s corner]
+  (let [[incoming outgoing] (corner-lines s corner)
+        corner-position (point-position s corner)
+        a (point-position s (:sketch.entity/a incoming))
+        b (point-position s (:sketch.entity/b outgoing))
+        len-ca (vlen (vsub a corner-position))
+        len-cb (vlen (vsub b corner-position))
+        u (vnorm (vsub a corner-position))
+        v (vnorm (vsub b corner-position))
+        theta (#?(:clj Math/acos :cljs js/Math.acos) (max -1.0 (min 1.0 (vdot u v))))]
+    (when (< theta 1.0e-6) (throw (ex-info "corner edges are collinear" {:corner corner})))
+    {:incoming incoming :outgoing outgoing :corner-position corner-position
+     :u u :v v :len-ca len-ca :len-cb len-cb :theta theta}))
+
+(defn- splice-corner [s incoming outgoing start-id start-point end-id end-point replacement]
+  (-> s
+      (assoc-in [:sketch/points start-id] (sketch-point start-id (first start-point) (second start-point) true))
+      (assoc-in [:sketch/points end-id] (sketch-point end-id (first end-point) (second end-point) true))
+      (update :sketch/entities
+              (fn [entities] (mapv (fn [e] (cond (= (:sketch.entity/id incoming) (:sketch.entity/id e)) (assoc e :sketch.entity/b start-id)
+                                                 (= (:sketch.entity/id outgoing) (:sketch.entity/id e)) (assoc e :sketch.entity/a end-id)
+                                                 :else e))
+                                   entities)))
+      (update :sketch/entities conj replacement)))
+
+(defn fillet-sketch
+  "Round the corner at `corner` with a tangent arc of `radius`, replacing the
+  shared vertex with trim points `start-id`/`end-id` and arc `arc-id`."
+  [s corner radius start-id end-id arc-id]
+  (when-not (pos? radius) (throw (ex-info "fillet radius must be positive" {:radius radius})))
+  (let [{:keys [incoming outgoing corner-position u v len-ca len-cb theta]} (corner-geometry s corner)
+        tangent-length (/ radius (#?(:clj Math/tan :cljs js/Math.tan) (/ theta 2)))]
+    (when (or (>= tangent-length len-ca) (>= tangent-length len-cb))
+      (throw (ex-info "fillet radius exceeds adjacent edge length"
+                      {:radius radius :tangent-length tangent-length :len-ca len-ca :len-cb len-cb})))
+    (let [start-point (vadd corner-position (vscale u tangent-length))
+          end-point (vadd corner-position (vscale v tangent-length))
+          bisector (vnorm (vadd u v))
+          center (vadd corner-position (vscale bisector (/ radius (#?(:clj Math/sin :cljs js/Math.sin) (/ theta 2)))))]
+      (splice-corner s incoming outgoing start-id start-point end-id end-point
+                     (sketch-arc arc-id start-id end-id center)))))
+
+(defn chamfer-sketch
+  "Cut the corner at `corner` with a straight chamfer of `distance` measured
+  along each incident edge, replacing the shared vertex with trim points
+  `start-id`/`end-id` and chamfer segment `chamfer-id`."
+  [s corner distance start-id end-id chamfer-id]
+  (when-not (pos? distance) (throw (ex-info "chamfer distance must be positive" {:distance distance})))
+  (let [{:keys [incoming outgoing corner-position u v len-ca len-cb]} (corner-geometry s corner)]
+    (when (or (>= distance len-ca) (>= distance len-cb))
+      (throw (ex-info "chamfer distance exceeds adjacent edge length"
+                      {:distance distance :len-ca len-ca :len-cb len-cb})))
+    (let [start-point (vadd corner-position (vscale u distance))
+          end-point (vadd corner-position (vscale v distance))]
+      (splice-corner s incoming outgoing start-id start-point end-id end-point
+                     (sketch-line chamfer-id start-id end-id)))))
+
+(defn- tessellate-entity
+  "Sample one sketch entity into its 2D points, excluding the trailing
+  endpoint so closed loops concatenate without duplicate vertices."
+  [s entity segments]
+  (case (:sketch.entity/kind entity)
+    :line [(point-position s (:sketch.entity/a entity))]
+    :arc (let [center (:sketch.entity/center entity)
+               p1 (point-position s (:sketch.entity/a entity))
+               p2 (point-position s (:sketch.entity/b entity))
+               r (vlen (vsub p1 center))
+               atan2 (fn [[x y]] #?(:clj (Math/atan2 y x) :cljs (js/Math.atan2 y x)))
+               pi #?(:clj Math/PI :cljs js/Math.PI)
+               a1 (atan2 (vsub p1 center)) a2 (atan2 (vsub p2 center))
+               raw-delta (- a2 a1)
+               delta (cond (> raw-delta pi) (- raw-delta (* 2 pi))
+                           (< raw-delta (- pi)) (+ raw-delta (* 2 pi))
+                           :else raw-delta)]
+           (mapv (fn [i] (let [angle (+ a1 (* delta (/ i segments)))]
+                           (vadd center (vscale [(#?(:clj Math/cos :cljs js/Math.cos) angle)
+                                                  (#?(:clj Math/sin :cljs js/Math.sin) angle)] r))))
+                 (range segments)))
+    (throw (ex-info "unsupported sketch entity for tessellation" {:kind (:sketch.entity/kind entity)}))))
+
+(defn sketch-loop->polygon
+  "Walk a sketch's entities as a single closed loop (each entity's `:b`
+  matching the next entity's `:a`) into a flat 3D polygon point list
+  consumable by `extrude-polygon`, tessellating arcs along the way."
+  ([s] (sketch-loop->polygon s 16))
+  ([s segments]
+   (let [entities (:sketch/entities s)
+         by-start (into {} (map (juxt :sketch.entity/a identity) entities))]
+     (when-not (= (count entities) (count by-start))
+       (throw (ex-info "sketch entities must form a single closed loop (one edge per start point)" {})))
+     (let [start-id (:sketch.entity/a (first entities))
+           points (loop [current-id start-id acc [] steps 0]
+                    (if (and (pos? steps) (= current-id start-id))
+                      acc
+                      (do (when (> steps (count entities))
+                            (throw (ex-info "sketch loop never returns to its start point" {:start start-id})))
+                          (let [entity (get by-start current-id)]
+                            (when-not entity (throw (ex-info "sketch loop is not closed" {:missing-start current-id})))
+                            (recur (:sketch.entity/b entity)
+                                   (into acc (tessellate-entity s entity segments))
+                                   (inc steps))))))]
+       (mapv (fn [[x y]] [x y 0]) points)))))
+
 ;; Ordered parametric feature history. Features refer only to earlier feature
 ;; ids, making rebuild results deterministic and project-file portable.
 (defn feature
@@ -230,6 +366,9 @@
       :reverse (reverse-curve (first inputs))
       :join (join-curves inputs (:tolerance p 1.0e-6))
       :loft (loft inputs (:segments p 32))
+      :fillet-sketch (fillet-sketch (first inputs) (:corner p) (:radius p) (:start-id p) (:end-id p) (:arc-id p))
+      :chamfer-sketch (chamfer-sketch (first inputs) (:corner p) (:distance p) (:start-id p) (:end-id p) (:chamfer-id p))
+      :sketch->polygon (sketch-loop->polygon (first inputs) (:segments p 16))
       :extrude (extrude-polygon (first inputs) (:direction p))
       (throw (ex-info "unsupported CAD feature" {:kind (:feature/kind feature)})))))
 

@@ -122,3 +122,72 @@
                  (cad/extrude-polygon [[0 0 0] [1 0 0] [1 0 0]] [0 0 1])))
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (cad/extrude-polygon [[0 0 0] [1 0 0] [0 1 0]] [0 0 0])))))
+
+(defn- square-sketch []
+  (cad/sketch [(cad/sketch-point :p0 0 0 true) (cad/sketch-point :p1 4 0 true)
+               (cad/sketch-point :p2 4 4 true) (cad/sketch-point :p3 0 4 true)]
+              [(cad/sketch-line :l0 :p0 :p1) (cad/sketch-line :l1 :p1 :p2)
+               (cad/sketch-line :l2 :p2 :p3) (cad/sketch-line :l3 :p3 :p0)]
+              []))
+
+(deftest fillet-sketch-rounds-a-right-angle-corner
+  (let [filleted (cad/fillet-sketch (square-sketch) :p1 1 :fs :fe :farc)
+        start (get-in filleted [:sketch/points :fs :sketch.point/position])
+        end (get-in filleted [:sketch/points :fe :sketch.point/position])
+        arc (first (filter #(= :farc (:sketch.entity/id %)) (:sketch/entities filleted)))
+        center (:sketch.entity/center arc)
+        l0 (first (filter #(= :l0 (:sketch.entity/id %)) (:sketch/entities filleted)))
+        l1 (first (filter #(= :l1 (:sketch.entity/id %)) (:sketch/entities filleted)))]
+    (is (near-point? [3.0 0.0] start))
+    (is (near-point? [4.0 1.0] end))
+    (is (near-point? [3.0 1.0] center))
+    (is (= :fs (:sketch.entity/b l0)))
+    (is (= :fe (:sketch.entity/a l1)))
+    ;; tangency: center->start is perpendicular to l0's direction, center->end to l1's
+    (is (< (#?(:clj Math/abs :cljs js/Math.abs)
+            (reduce + (map * (map - start center) [1 0]))) 1.0e-9))
+    (is (< (#?(:clj Math/abs :cljs js/Math.abs)
+            (reduce + (map * (map - end center) [0 1]))) 1.0e-9))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (cad/fillet-sketch (square-sketch) :p1 5 :fs :fe :farc)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (cad/fillet-sketch (square-sketch) :p1 -1 :fs :fe :farc)))))
+
+(deftest chamfer-sketch-cuts-a-right-angle-corner
+  (let [chamfered (cad/chamfer-sketch (square-sketch) :p1 1 :cs :ce :cseg)
+        start (get-in chamfered [:sketch/points :cs :sketch.point/position])
+        end (get-in chamfered [:sketch/points :ce :sketch.point/position])
+        seg (first (filter #(= :cseg (:sketch.entity/id %)) (:sketch/entities chamfered)))]
+    (is (near-point? [3.0 0.0] start))
+    (is (near-point? [4.0 1.0] end))
+    (is (= :cs (:sketch.entity/a seg)))
+    (is (= :ce (:sketch.entity/b seg)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (cad/chamfer-sketch (square-sketch) :p1 4 :cs :ce :cseg)))))
+
+(deftest filleted-sketch-loop-extrudes-watertight
+  (let [filleted (cad/fillet-sketch (square-sketch) :p1 1 :fs :fe :farc)
+        polygon (cad/sketch-loop->polygon filleted 8)
+        solid (cad/extrude-polygon polygon [0 0 2])]
+    (is (= 12 (count polygon)))
+    (is (= (count polygon) (count (distinct polygon))))
+    (is (cad/watertight-solid? solid))
+    (is (= (* 2 (count polygon)) (count (:solid/vertices solid))))))
+
+(deftest chamfered-sketch-loop-extrudes-watertight
+  (let [chamfered (cad/chamfer-sketch (square-sketch) :p1 1 :cs :ce :cseg)
+        polygon (cad/sketch-loop->polygon chamfered)
+        solid (cad/extrude-polygon polygon [0 0 2])]
+    (is (= 5 (count polygon)))
+    (is (cad/watertight-solid? solid))))
+
+(deftest fillet-sketch-participates-in-feature-tree
+  (let [model (cad/feature-model
+               [(cad/feature :sketch :source [] {:value (square-sketch)})
+                (cad/feature :round :fillet-sketch [:sketch]
+                            {:corner :p1 :radius 1 :start-id :fs :end-id :fe :arc-id :farc})
+                (cad/feature :profile :sketch->polygon [:round] {:segments 8})
+                (cad/feature :solid :extrude [:profile] {:direction [0 0 2]})])
+        rebuilt (cad/recompute-feature-model model)]
+    (is (= :ok (get-in rebuilt [:feature-model/statuses :solid :status])))
+    (is (cad/watertight-solid? (get-in rebuilt [:feature-model/results :solid])))))
