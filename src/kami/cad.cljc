@@ -355,7 +355,7 @@
 (defn suppress-feature [model id suppressed?]
   (update-feature model id assoc :feature/suppressed? (boolean suppressed?)))
 
-(declare extrude-polygon)
+(declare extrude-polygon boolean-union boolean-difference boolean-intersect)
 (defn- evaluate-feature [feature inputs]
   (let [p (:feature/params feature)]
     (case (:feature/kind feature)
@@ -370,6 +370,13 @@
       :chamfer-sketch (chamfer-sketch (first inputs) (:corner p) (:distance p) (:start-id p) (:end-id p) (:chamfer-id p))
       :sketch->polygon (sketch-loop->polygon (first inputs) (:segments p 16))
       :extrude (extrude-polygon (first inputs) (:direction p))
+      ;; Boolean feature kinds always evaluate to a *vector* of 0..2 result
+      ;; solids (see `boolean-union`/`boolean-difference`/`boolean-intersect`
+      ;; docstrings) -- consumers that need a single mesh must pick an
+      ;; element (typically `(first result)`) and check `(seq result)`.
+      :boolean-union (boolean-union (first inputs) (second inputs))
+      :boolean-difference (boolean-difference (first inputs) (second inputs))
+      :boolean-intersect (boolean-intersect (first inputs) (second inputs))
       (throw (ex-info "unsupported CAD feature" {:kind (:feature/kind feature)})))))
 
 (defn recompute-feature-model
@@ -449,3 +456,231 @@
     (#?(:clj Math/abs :cljs js/Math.abs)
      (/ (reduce + (map (fn [[a b c]] (triple (nth positions a) (nth positions b) (nth positions c)))
                        (partition 3 indices))) 6.0))))
+
+;; Boolean solid operations: union / difference / intersect.
+;;
+;; Every solid this engine can currently produce is an `extrude-polygon`
+;; result: a planar cross-section polygon rigidly translated by one
+;; extrusion vector ("prism"). That gives every solid a product structure
+;; (2D cross-section polygon) x (1D interval along the extrusion axis), which
+;; is what makes a *genuinely correct*, tractable boolean possible here
+;; without a general triangle-mesh/BREP boolean kernel (out of scope --
+;; see ADR for the full writeup, following the same narrow-first-cut
+;; discipline as org-iso-10303's axis-aligned-cylinder-only revolve).
+;;
+;; Supported input, for ALL THREE ops (anything else throws ex-info):
+;;   - both solids must be watertight `extrude-polygon` prisms (2n vertices,
+;;     n+2 faces, top = bottom rigidly translated by one vector);
+;;   - the extrusion direction must be axis-aligned (exactly one of x/y/z
+;;     nonzero) and the SAME coordinate axis for both solids ("coaxial" in
+;;     the sense of a shared axis *direction* -- the two cross-section
+;;     polygons may sit anywhere in the plane perpendicular to that axis,
+;;     they need not share a common axis *line*);
+;;   - each solid's cross-section polygon must be planar (both caps lie
+;;     exactly in a plane perpendicular to the axis) and convex.
+;;
+;; `boolean-intersect` is unconditionally correct for any two such prisms:
+;; the Cartesian-product identity (A1xB1) ∩ (A2xB2) = (A1∩A2)x(B1∩B2) holds
+;; for arbitrary sets, so (cross-section-polygon intersection) x
+;; (axis-interval intersection) IS exactly the solid intersection. Cross-
+;; section intersection is computed with Sutherland-Hodgman convex clipping
+;; (exact for convex-vs-convex, never introduces a hole).
+;;
+;; `boolean-union` / `boolean-difference` additionally require the two
+;; solids to share an IDENTICAL cross-section polygon (same profile,
+;; differing only in the axis interval -- e.g. stacking/cutting the same
+;; rounded-rect profile at different heights along its own extrusion axis).
+;; This extra restriction is deliberate, not an oversight: the analogous
+;; product identity for union/difference does NOT hold in general --
+;; (A1xB1) ∪ (A2xB2) != (A1∪A2)x(B1∪B2) unless A1=A2 or B1=B2 -- and general
+;; convex-minus-convex cross-section subtraction can produce a
+;; multiply-connected result (a polygon WITH A HOLE, e.g. a square frame),
+;; which this engine's single-loop `extrude-polygon` cannot represent at
+;; all. Rather than ship a booleans that is silently wrong off that
+;; boundary, off-profile union/difference (e.g. biting a notch out of the
+;; side of a box with a differently-shaped tool) is explicitly NOT
+;; supported and throws.
+;;
+;; NOT supported (throws ex-info in all cases): non-axis-aligned extrusion
+;; direction, mismatched extrusion axis between the two solids, non-convex
+;; or non-planar cross-sections, self-intersecting polygons, and (for
+;; union/difference only) mismatched cross-section profiles.
+;;
+;; Return shape: all three ops return a *vector* of 0..2 result solids
+;; (never a bare solid), so callers have one consistent shape to handle:
+;;   - `boolean-intersect` -> `[]` when the solids don't overlap, else `[s]`.
+;;   - `boolean-union`     -> `[s]` when the axis intervals touch/overlap
+;;     (merged into one solid), else `[a b]` (both originals, unmerged --
+;;     this engine does not fuse two disjoint solids into one manifold).
+;;   - `boolean-difference` (a minus b) -> `[a]` unchanged when b doesn't
+;;     overlap a's interval, `[]` when b fully covers a's interval, else a
+;;     vector of 1-2 solids for the remaining slab(s) of a's interval.
+
+(def ^:private axis-index {:x 0 :y 1 :z 2})
+(def ^:private plane-indices {:x [1 2] :y [2 0] :z [0 1]})
+(def ^:private boolean-eps 1.0e-9)
+
+(defn- direction-axis [direction]
+  (let [nonzero (keep-indexed (fn [i v] (when (> (#?(:clj Math/abs :cljs js/Math.abs) v) boolean-eps) i))
+                              direction)]
+    (when (not= 1 (count nonzero))
+      (throw (ex-info "boolean solid ops require an axis-aligned extrusion direction (exactly one of x/y/z nonzero)"
+                      {:direction direction})))
+    (get [:x :y :z] (first nonzero))))
+
+(defn- polygon-signed-area [points]
+  (* 0.5 (reduce + (map (fn [[x1 y1] [x2 y2]] (- (* x1 y2) (* x2 y1)))
+                       points (concat (rest points) [(first points)])))))
+
+(defn- ensure-ccw [points]
+  (if (neg? (polygon-signed-area points)) (vec (reverse points)) (vec points)))
+
+(defn- convex-polygon?
+  "True when `points` (2D, CCW) never turn clockwise at any vertex,
+  i.e. the polygon is convex (collinear vertices are tolerated)."
+  [points]
+  (let [n (count points)
+        cross (fn [[ax ay] [bx by] [cx cy]] (- (* (- bx ax) (- cy ay)) (* (- by ay) (- cx ax))))
+        signs (for [i (range n)]
+                (cross (nth points i) (nth points (mod (inc i) n)) (nth points (mod (+ i 2) n))))]
+    (every? #(>= % (- boolean-eps)) signs)))
+
+(defn- dedupe-polygon
+  "Drop consecutive (cyclically) near-duplicate points left behind by
+  polygon clipping at shared vertices/edges."
+  [points]
+  (let [close? (fn [a b] (< (reduce + (map (fn [x y] (let [d (- x y)] (* d d))) a b)) 1.0e-18))
+        deduped (reduce (fn [acc p] (if (and (seq acc) (close? (peek acc) p)) acc (conj acc p))) [] points)]
+    (vec (if (and (> (count deduped) 1) (close? (peek deduped) (first deduped))) (pop deduped) deduped))))
+
+(defn- coaxial-prism
+  "Extract `{:axis :ai :i0 :i1 :polygon [[u v]...] :lo :hi}` from a
+  watertight solid, or throw if it is not a supported axis-aligned
+  convex-polygon `extrude-polygon` prism. `:polygon` is the CCW
+  cross-section expressed in the 2D plane perpendicular to `:axis`;
+  `:lo`/`:hi` are the axis-coordinate interval the prism spans."
+  [s]
+  (when-not (watertight-solid? s) (throw (ex-info "boolean solid ops require a watertight solid" {})))
+  (let [vertices (:solid/vertices s) total (count vertices) n (quot total 2)]
+    (when-not (and (even? total) (>= n 3) (= (count (:solid/faces s)) (+ n 2)))
+      (throw (ex-info "boolean solid ops only support extrude-polygon prisms (two n-gon caps + n side quads)"
+                      {:vertex-count total :face-count (count (:solid/faces s))})))
+    (let [bottom (subvec vertices 0 n) top (subvec vertices n)
+          direction (mapv - (first top) (first bottom))]
+      (when-not (every? true? (map (fn [b t] (= t (mapv + b direction))) bottom top))
+        (throw (ex-info "boolean solid ops only support rigid-translation (prism) solids" {})))
+      (let [axis (direction-axis direction) ai (get axis-index axis) [i0 i1] (get plane-indices axis)
+            axis-values (mapv #(nth % ai) bottom)]
+        (when-not (apply = axis-values)
+          (throw (ex-info "boolean solid ops require the cross-section to be planar perpendicular to the extrusion axis"
+                          {:axis axis :axis-values axis-values})))
+        (let [polygon (ensure-ccw (mapv (fn [v] [(nth v i0) (nth v i1)]) bottom))]
+          (when-not (convex-polygon? polygon)
+            (throw (ex-info "boolean solid ops only support convex cross-sections" {:polygon polygon})))
+          (let [a (first axis-values) b (+ a (nth direction ai))]
+            {:axis axis :ai ai :i0 i0 :i1 i1 :polygon polygon :lo (min a b) :hi (max a b)}))))))
+
+(defn- clip-against-edge
+  "Sutherland-Hodgman: keep the part of `subject` (any simple polygon) on
+  the interior side of the directed edge a->b of a CCW convex clip polygon."
+  [subject a b]
+  (let [[ax ay] a [bx by] b
+        side (fn [[x y]] (- (* (- bx ax) (- y ay)) (* (- by ay) (- x ax))))
+        inside? (fn [p] (>= (side p) (- boolean-eps)))
+        lerp (fn [c n t] (mapv (fn [cv nv] (+ cv (* t (- nv cv)))) c n))
+        edges (map vector subject (concat (rest subject) [(first subject)]))]
+    (vec (mapcat (fn [[cur nxt]]
+                  (let [cur-in (inside? cur) nxt-in (inside? nxt)]
+                    (cond
+                      (and cur-in nxt-in) [nxt]
+                      (and cur-in (not nxt-in))
+                      [(lerp cur nxt (/ (side cur) (- (side cur) (side nxt))))]
+                      (and (not cur-in) nxt-in)
+                      [(lerp cur nxt (/ (side cur) (- (side cur) (side nxt)))) nxt]
+                      :else [])))
+                edges))))
+
+(defn- convex-polygon-intersection
+  "Exact intersection of two CCW convex polygons via Sutherland-Hodgman
+  clipping. Returns `[]` when they don't overlap (or only touch)."
+  [subject clip]
+  (let [clip-edges (map vector clip (concat (rest clip) [(first clip)]))
+        clipped (reduce (fn [poly [a b]] (if (empty? poly) poly (clip-against-edge poly a b))) subject clip-edges)
+        deduped (dedupe-polygon clipped)]
+    (if (or (< (count deduped) 3) (<= (#?(:clj Math/abs :cljs js/Math.abs) (polygon-signed-area deduped)) boolean-eps))
+      []
+      deduped)))
+
+(defn- points-close? [a b] (every? true? (map (fn [x y] (< (#?(:clj Math/abs :cljs js/Math.abs) (- x y)) boolean-eps)) a b)))
+(defn- rotations [xs] (map #(into (subvec xs %) (subvec xs 0 %)) (range (count xs))))
+(defn- same-polygon?
+  "Whether two CCW polygons describe the same shape, allowing the vertex
+  list to start at a different (but still cyclically-consistent) corner."
+  [a b]
+  (and (= (count a) (count b))
+       (boolean (some (fn [rotated] (every? true? (map points-close? rotated b))) (rotations (vec a))))))
+
+(defn- lift-point [ai i0 i1 axis-value [u v]]
+  (-> [0.0 0.0 0.0] (assoc i0 (double u)) (assoc i1 (double v)) (assoc ai (double axis-value))))
+
+(defn- extrude-coaxial-solid
+  "Rebuild a solid from prism data `{:axis :ai :i0 :i1}` plus an explicit
+  cross-section `polygon` and axis interval `[lo hi]`."
+  [{:keys [axis ai i0 i1]} polygon lo hi]
+  (let [points (mapv (partial lift-point ai i0 i1 lo) polygon)
+        direction (assoc [0.0 0.0 0.0] ai (double (- hi lo)))]
+    (extrude-polygon points direction)))
+
+(defn boolean-intersect
+  "Solid intersection A ∩ B. See the boolean-ops scope note above this
+  section for exactly which solids are supported (axis-aligned coaxial
+  convex-polygon prisms; anything else throws). Returns `[]` when the two
+  solids don't overlap, else `[result]`."
+  [a b]
+  (let [pa (coaxial-prism a) pb (coaxial-prism b)]
+    (when-not (= (:axis pa) (:axis pb))
+      (throw (ex-info "boolean solid ops require both solids to share the same extrusion axis"
+                      {:axis-a (:axis pa) :axis-b (:axis pb)})))
+    (let [lo (max (:lo pa) (:lo pb)) hi (min (:hi pa) (:hi pb))
+          poly (convex-polygon-intersection (:polygon pa) (:polygon pb))]
+      (if (or (<= hi lo) (empty? poly))
+        []
+        [(extrude-coaxial-solid pa poly lo hi)]))))
+
+(defn boolean-union
+  "Solid union A ∪ B, scoped to solids sharing an identical cross-section
+  profile (see scope note above): the axis intervals are merged when they
+  touch or overlap, else both solids are returned unmerged. Throws if the
+  two solids don't share the same axis or the same cross-section profile."
+  [a b]
+  (let [pa (coaxial-prism a) pb (coaxial-prism b)]
+    (when-not (= (:axis pa) (:axis pb))
+      (throw (ex-info "boolean solid ops require both solids to share the same extrusion axis"
+                      {:axis-a (:axis pa) :axis-b (:axis pb)})))
+    (when-not (same-polygon? (:polygon pa) (:polygon pb))
+      (throw (ex-info "boolean-union only supports solids that share an identical cross-section profile (axis-interval union only)"
+                      {})))
+    (let [lo (min (:lo pa) (:lo pb)) hi (max (:hi pa) (:hi pb))
+          gap? (> (max (:lo pa) (:lo pb)) (min (:hi pa) (:hi pb)))]
+      (if gap? [a b] [(extrude-coaxial-solid pa (:polygon pa) lo hi)]))))
+
+(defn boolean-difference
+  "Solid difference A − B, scoped to solids sharing an identical
+  cross-section profile (see scope note above): subtracts B's axis
+  interval from A's, returning the surviving slab(s) of A as 0-2 solids
+  with A's original profile. Throws if the two solids don't share the
+  same axis or the same cross-section profile."
+  [a b]
+  (let [pa (coaxial-prism a) pb (coaxial-prism b)]
+    (when-not (= (:axis pa) (:axis pb))
+      (throw (ex-info "boolean solid ops require both solids to share the same extrusion axis"
+                      {:axis-a (:axis pa) :axis-b (:axis pb)})))
+    (when-not (same-polygon? (:polygon pa) (:polygon pb))
+      (throw (ex-info "boolean-difference only supports solids that share an identical cross-section profile (axis-interval difference only)"
+                      {})))
+    (let [lo (:lo pa) hi (:hi pa) cut-lo (max lo (:lo pb)) cut-hi (min hi (:hi pb))]
+      (if (>= cut-lo cut-hi)
+        [a]
+        (cond-> []
+          (> cut-lo lo) (conj (extrude-coaxial-solid pa (:polygon pa) lo cut-lo))
+          (< cut-hi hi) (conj (extrude-coaxial-solid pa (:polygon pa) cut-hi hi)))))))
