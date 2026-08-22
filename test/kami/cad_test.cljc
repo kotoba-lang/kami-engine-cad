@@ -250,3 +250,18 @@
         rebuilt (cad/recompute-feature-model model)]
     (is (= :ok (get-in rebuilt [:feature-model/statuses :solid :status])))
     (is (cad/watertight-solid? (get-in rebuilt [:feature-model/results :solid])))))
+
+(deftest an-unknown-constraint-is-refused-not-treated-as-satisfied
+  ;; A residual of 0 for a constraint kind the solver does not implement means
+  ;; "already satisfied". The sketch then reports :converged? true with that
+  ;; constraint doing nothing at all — the drawing appears, the dimension it
+  ;; was supposed to hold simply is not held, and nothing in the output says
+  ;; so. Refusing by name is the difference between a bug report and a part
+  ;; that is machined wrong.
+  (let [s (cad/sketch [(cad/sketch-point :a 0 0 true) (cad/sketch-point :b 1 1)]
+                      [(cad/sketch-line :l :a :b)]
+                      [(cad/constraint :odd :tangent {:constraint/a :a :constraint/b :b})])]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"unknown sketch constraint"
+                          (cad/constraint-residual s (first (:sketch/constraints s)))))
+    (testing "and the solver does not report a converged sketch for it"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default) (cad/solve-sketch s))))))
