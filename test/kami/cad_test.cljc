@@ -265,3 +265,74 @@
                           (cad/constraint-residual s (first (:sketch/constraints s)))))
     (testing "and the solver does not report a converged sketch for it"
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default) (cad/solve-sketch s))))))
+
+(deftest annulus-extrusion-is-watertight-with-exact-volume
+  ;; Cartridge-body shape: square block pierced by a square hydrogen flow
+  ;; channel. Outer 4x4x2 (32) minus hole 2x2x2 (8) -> 24 world units^3.
+  (let [solid (cad/extrude-polygon-with-holes
+               [[0 0 0] [4 0 0] [4 4 0] [0 4 0]]
+               [[[1 1 0] [3 1 0] [3 3 0] [1 3 0]]]
+               [0 0 2])
+        mesh (cad/solid-mesh solid)]
+    (is (cad/watertight-solid? solid))
+    (is (== 24.0 (cad/solid-volume solid)))
+    (is (= 16 (count (:solid/vertices solid))))
+    ;; caps: 2n strip triangles top + 2n bottom; sides: n outer quads + n hole quads
+    ;; -> 8n mesh triangles = 32 for n=4
+    (is (= 96 (count (:indices mesh))))                    ; 32 triangles * 3
+    (is (every? #(< -1 % 16) (:indices mesh)))
+    ;; the hole is genuinely open: no face covers the channel centre axis
+    (is (not-any? (fn [face] (some #(= % [1.0 1.0 0.0]) (map (:solid/vertices solid) face)))
+                  (remove #(= 3 (count %)) (:solid/faces solid))))))
+
+(deftest annulus-extrusion-tube-cross-section-carries-through-volume
+  ;; The subtractive identity a cartridge designer needs: volume == outer
+  ;; prism volume minus hole prism volume, computed from the mesh alone.
+  (let [outer [[0 0 0] [6 0 0] [6 6 0] [0 6 0]]
+        hole [[[2 2 0] [4 2 0] [4 4 0] [2 4 0]]]
+        holed (cad/extrude-polygon-with-holes outer hole [0 0 3])
+        outer-vol (cad/solid-volume (cad/extrude-polygon outer [0 0 3]))
+        hole-vol (cad/solid-volume (cad/extrude-polygon (first hole) [0 0 3]))]
+    (is (cad/watertight-solid? holed))
+    (is (< (#?(:clj Math/abs :cljs js/Math.abs)
+            (- (cad/solid-volume holed) (- outer-vol hole-vol)))
+           1.0e-9))))
+
+(deftest annulus-extrusion-participates-in-feature-tree
+  (let [model (cad/feature-model
+               [(cad/feature :profile :source [] {:value [[0 0 0] [4 0 0] [4 4 0] [0 4 0]]})
+                (cad/feature :body :extrude-with-holes [:profile]
+                             {:holes [[[1 1 0] [3 1 0] [3 3 0] [1 3 0]]] :direction [0 0 2]})])
+        rebuilt (cad/recompute-feature-model model)]
+    (is (= :ok (get-in rebuilt [:feature-model/statuses :body :status])))
+    (is (== 24.0 (cad/solid-volume (get-in rebuilt [:feature-model/results :body]))))))
+
+(deftest annulus-extrusion-refuses-invalid-holes-loudly
+  (let [outer [[0 0 0] [4 0 0] [4 4 0] [0 4 0]]
+        aligned [[[1 1 0] [3 1 0] [3 3 0] [1 3 0]]]]
+    ;; two holes: out of scope, not silently reduced
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"exactly one hole"
+                          (cad/extrude-polygon-with-holes outer [aligned aligned] [0 0 2])))
+    ;; hole outside the outer loop
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"strictly inside"
+                          (cad/extrude-polygon-with-holes
+                           outer [[[10 10 0] [12 10 0] [12 12 0] [10 12 0]]] [0 0 2])))
+    ;; vertex-count mismatch (the pairing contract)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"same vertex count"
+                          (cad/extrude-polygon-with-holes
+                           outer [[[1 1 0] [3 1 0] [2 2 0]]] [0 0 2])))
+    ;; misaligned start index -> cap strips would cross -> refused
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"crosses the cap strips"
+                          (cad/extrude-polygon-with-holes
+                           outer [[[3 3 0] [1 3 0] [1 1 0] [3 1 0]]] [0 0 2])))
+    ;; non-convex hole
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"hole loop must be convex"
+                          (cad/extrude-polygon-with-holes
+                           outer [[[1 1 0] [3 1 0] [2 2 0] [3 3 0] [1 3 0]]] [0 0 2])))
+    ;; non-axis-aligned direction is out of scope for the planar-pairing math
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"axis-aligned"
+                          (cad/extrude-polygon-with-holes outer aligned [1 0 1])))
+    ;; non-planar hole
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs :default) #"planar"
+                          (cad/extrude-polygon-with-holes
+                           outer [[[1 1 0] [3 1 0.5] [3 3 0] [1 3 0]]] [0 0 2])))))
