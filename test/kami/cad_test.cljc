@@ -265,3 +265,88 @@
                           (cad/constraint-residual s (first (:sketch/constraints s)))))
     (testing "and the solver does not report a converged sketch for it"
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default) (cad/solve-sketch s))))))
+
+(deftest revolve-cylinder-closed-by-two-apexes
+  (let [s (cad/revolve [[0 0 0] [1 0 0] [1 0 2] [0 0 2]] 4)]
+    (is (cad/watertight-solid? s))
+    ;; 4-sector cylinder of radius 1, height 2: cross-section is the square
+    ;; inscribed in the unit circle -> volume 2*2 = 4 exactly.
+    (is (< (Math/abs (- (cad/solid-volume s) 4.0)) 1.0e-9))))
+
+(deftest revolve-converges-to-true-cylinder
+  (let [s (cad/revolve [[0 0 0] [1 0 0] [1 0 2] [0 0 2]] 720)]
+    (is (cad/watertight-solid? s))
+    ;; discrete n-gon prism volume (n/2)R^2 sin(2pi/n) H, here ~2pi
+    (let [expected (* 0.5 720 1.0 1.0
+                      (#?(:clj Math/sin :cljs js/Math.sin)
+                       (/ (* 2 Math/PI) 720))
+                      2.0)]
+      (is (< (Math/abs (- (cad/solid-volume s) expected)) 1.0e-9))
+      (is (< (Math/abs (- (cad/solid-volume s) (* 2.0 Math/PI))) 1.0e-4)))))
+
+(deftest revolve-annular-cylinder-open-bore
+  ;; an open bore is modelled by running the profile back to the axis
+  (let [s (cad/revolve [[0 0 0] [2 0 0] [2 0 1] [3 0 1] [3 0 0] [0 0 0]] 1000)]
+    (is (cad/watertight-solid? s))
+    ;; analytic annular cylinder volume pi(R^2-r^2)H = 5pi
+    (is (< (Math/abs (- (cad/solid-volume s) (* 5.0 Math/PI))) 1.0e-2))))
+
+(deftest revolve-ring-end-caps-enclose-full-cylinder
+  ;; a profile ending at ring points is closed by disc caps: this profile
+  ;; is the full cross-section half-loop minus its axis return, so the
+  ;; result is the FULL solid cylinder pi R^2 H
+  (let [s (cad/revolve [[2 0 0] [3 0 0] [3 0 1] [2 0 1]] 1000)]
+    (is (cad/watertight-solid? s))
+    (is (< (Math/abs (- (cad/solid-volume s) (* 9.0 Math/PI))) 1.0e-2))))
+
+(deftest revolve-cone-bicone-volume
+  (let [s (cad/revolve [[0 0 0] [1 0 1] [0 0 2]] 360)]
+    (is (cad/watertight-solid? s))
+    ;; bicone: two cones of height 1, max radius 1 -> V = 2/3 * area of the
+    ;; discrete n-gon base
+    (let [base-area (* 0.5 360 1.0 1.0
+                       (#?(:clj Math/sin :cljs js/Math.sin)
+                        (/ (* 2 Math/PI) 360)))
+          expected (* 2.0 (/ base-area 3.0))]
+      (is (< (Math/abs (- (cad/solid-volume s) expected)) 1.0e-9))
+      (is (< (Math/abs (- (cad/solid-volume s) (* (/ 2.0 3.0) Math/PI))) 5.0e-4)))))
+
+(deftest revolve-interior-apex-hourglass-is-watertight
+  (let [s (cad/revolve [[1 0 0] [2 0 0] [0 0 1] [2 0 2] [1 0 2]] 12)]
+    (is (cad/watertight-solid? s))))
+
+(deftest revolve-refuses-bad-input
+  (testing "fewer than two points"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[1 0 0]] 8))))
+  (testing "sector count below 3"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[0 0 0] [1 0 0] [0 0 1]] 2)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[0 0 0] [1 0 0] [0 0 1]] 3.5))))
+  (testing "negative radius"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[-1 0 0] [1 0 0]] 8))))
+  (testing "off-plane point (y /= 0)"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[1 0 0] [1 0.1 1]] 8))))
+  (testing "consecutive duplicate profile points"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[1 0 0] [1 0 0] [2 0 1]] 8))))
+  (testing "segment lying on the axis (both radii 0)"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[0 0 0] [0 0 1] [1 0 1]] 8))))
+  (testing "non-3D point"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/revolve [[1 0] [2 0]] 8)))))
+
+(deftest revolve-meshes-and-refuses-boolean-prism-contract
+  (let [s (cad/revolve [[0 0 0] [1 0 0] [1 0 2] [0 0 2]] 8)
+        m (cad/solid-mesh s)]
+    (is (= (count (:solid/vertices s)) (count (:positions m))))
+    ;; documented composition boundary: booleans accept only
+    ;; extrude-polygon prisms and must refuse a revolve loudly
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/boolean-union s
+                                    (cad/extrude-polygon [[0 0 0] [1 0 0] [1 1 0] [0 1 0]]
+                                                         [0 0 1]))))))
