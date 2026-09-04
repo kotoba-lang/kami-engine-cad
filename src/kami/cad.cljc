@@ -438,6 +438,144 @@
     (when-not (watertight-solid? result) (throw (ex-info "extrusion produced invalid topology" {})))
     result))
 
+(defn revolve
+  "Revolve a closed planar profile about the Z axis into a closed topological
+  solid of revolution — the rotational sibling of `extrude-polygon`.
+
+  The system's pressure-bearing shape family (700-bar H2 cylinders, the
+  replaceable Mg/MgH2 cartridge's cylindrical shell and heater bore) is
+  axisymmetric, which a prism extruder cannot represent. This is the
+  smallest upstream primitive for that family; `vdesign.cad` and
+  `kotoba-lang/brep` both document revolve as not-yet-implemented, so
+  packaging consumers currently cannot compose an axisymmetric solid at all.
+
+  Input (all caller-supplied, fails closed with ex-info):
+    profile  — ordered 3D points [x y z] in the XZ plane (y must be 0),
+               x >= 0 (radius), at least two, consecutive points distinct.
+               The profile is an OPEN polyline: an endpoint with x > 0 is
+               closed by a disc cap of its revolution ring, while a point
+               with x = 0 is an apex on the axis (cone tip / disc centre).
+               To model a shape with an open bore (e.g. an annular
+               cylinder), run the profile out to the bore radius, along the
+               bore, and back to the axis — i.e. end the profile on the
+               axis again — instead of leaving a ring endpoint.
+               A segment lying ON the axis (both ends x = 0) is refused as
+               degenerate.
+    sectors  — positive integer >= 3: number of angular steps around the
+               axis (explicit caller parameter — discretisation is never
+               hidden; finer sectors converge to the true surface).
+
+  Returns a watertight `:cad/kind :solid` with quad side faces (triangles
+  at apexes), disc-cap fan faces at profile ends with x > 0, and the
+  watertight topology asserted before returning (same discipline as
+  `extrude-polygon`). Every edge of the result is shared by exactly two
+  faces, verified by `watertight-solid?`.
+
+  Composition boundary, disclosed: the result is a `:cad/kind :solid` and
+  meshes (`solid-mesh`) and measures (`solid-volume`) fine, but the
+  boolean ops below accept only `extrude-polygon` prisms and will refuse a
+  revolve result loudly (ex-info) — that is their documented narrow-first-cut
+  scope, not a silent misbehaviour.
+
+  The only constant used is π (mathematics). No material property is
+  involved; this is pure geometry."
+  [profile sectors]
+  (when (or (not (sequential? profile))
+            (< (count profile) 2))
+    (throw (ex-info "revolve needs an ordered profile of at least two 3D points"
+                    {:profile-count (count profile)})))
+  (when-not (and (integer? sectors) (>= sectors 3))
+    (throw (ex-info "revolve needs an integer sector count >= 3"
+                    {:sectors sectors})))
+  (doseq [p profile]
+    (when-not (and (vector? p) (= 3 (count p)) (every? number? p))
+      (throw (ex-info "profile points must be 3D numeric vectors" {:point p})))
+    (let [[x y _z] p]
+      (when-not (zero? y)
+        (throw (ex-info "profile must lie in the XZ plane (y = 0)" {:point p})))
+      (when (or (neg? x) (not (number? x)))
+        (throw (ex-info "profile radius must be a non-negative number (x >= 0)"
+                        {:point p})))))
+  (doseq [[a b] (map vector profile (rest profile))]
+    (when (= a b)
+      (throw (ex-info "profile has consecutive duplicate points"
+                      {:point a}))))
+  (doseq [[a b] (map vector profile (rest profile))]
+    (when (and (zero? (nth a 0)) (zero? (nth b 0)))
+      (throw (ex-info "profile segment lies on the revolve axis (both radii 0)"
+                      {:segment [a b]}))))
+  (let [two-pi (* 2.0 #?(:clj Math/PI :cljs js/Math.PI))
+        thetas (mapv #(/ (* two-pi %) sectors) (range sectors))
+        apex? (fn [p] (zero? (nth p 0)))
+        ;; Vertex allocation: each apex point (x = 0) gets ONE index — its
+        ;; ring of revolution is a single point — while each ring point gets
+        ;; `sectors` indices. Distinct apexes (different z) keep distinct
+        ;; indices.
+        alloc (loop [i 0 next 0 acc {}]
+                (if (= i (count profile))
+                  acc
+                  (if (apex? (nth profile i))
+                    (recur (inc i) (inc next) (assoc acc i {:apex next}))
+                    (recur (inc i) (+ next sectors) (assoc acc i {:ring next})))))
+        total-v (reduce (fn [c [_ a]] (+ c (if (:apex a) 1 sectors))) 0 alloc)
+        vertices (vec (reduce (fn [v [i p]]
+                                (let [x (nth p 0) z (nth p 2)]
+                                  (if (apex? p)
+                                    (assoc v (:apex (alloc i)) [0.0 0.0 z])
+                                    (reduce (fn [v s]
+                                              (let [t (nth thetas s)]
+                                                (assoc v (+ (:ring (alloc i)) s)
+                                                       [(* x (#?(:clj Math/cos :cljs js/Math.cos) t))
+                                                        (* x (#?(:clj Math/sin :cljs js/Math.sin) t))
+                                                        z])))
+                                            v (range sectors)))))
+                              (vec (repeat total-v nil))
+                              (map-indexed vector profile)))
+        vidx (fn [i s]
+               (let [a (alloc i)]
+                 (if (:apex a) (:apex a) (+ (:ring a) (mod s sectors)))))
+        n (count profile)
+        side-faces (mapcat (fn [[i j]]
+                             (cond
+                               ;; apex -> ring: the apex ring degenerates to
+                               ;; one point, so each quad collapses to a cone
+                               ;; triangle over sector s.
+                               (apex? (nth profile i))
+                               (mapv (fn [s] [(vidx i 0) (vidx j s) (vidx j (inc s))])
+                                     (range sectors))
+                               ;; ring -> apex
+                               (apex? (nth profile j))
+                               (mapv (fn [s] [(vidx i s) (vidx j 0) (vidx i (inc s))])
+                                     (range sectors))
+                               :else
+                               (mapv (fn [s] [(vidx i s) (vidx j s)
+                                              (vidx j (inc s)) (vidx i (inc s))])
+                                     (range sectors))))
+                           (map vector (range n) (rest (range n))))
+        ;; disc caps close the revolve at profile ENDS with x > 0; an apex
+        ;; end is closed by its cone triangles and interior points need no
+        ;; cap (the surface passes through them). The fan direction must
+        ;; oppose the adjacent side face's circumferential edge direction:
+        ;; a quad [v(i,s) v(j,s) v(j,s+1) v(i,s+1)] runs index i's ring
+        ;; DESCENDING when i is the edge's first endpoint and ASCENDING when
+        ;; it is the second, so the first endpoint fans forward and the
+        ;; last endpoint fans reversed.
+        cap-faces (mapcat (fn [[i fwd?]]
+                            (when-not (apex? (nth profile i))
+                              (let [fan (fn [s] (if fwd?
+                                                  [(vidx i 0) (vidx i s) (vidx i (inc s))]
+                                                  [(vidx i 0) (vidx i (inc s)) (vidx i s)]))]
+                                ;; an n-gon cap triangulates with n-2 fan
+                                ;; triangles for s in 1..sectors-2 — the
+                                ;; wrap-around fan triangle would be a
+                                ;; degenerate self-edge
+                                (mapv fan (range 1 (dec sectors))))))
+                          [[0 true] [(dec n) false]])
+        result (solid vertices (vec (concat side-faces cap-faces)))]
+    (when-not (watertight-solid? result)
+      (throw (ex-info "revolve produced invalid topology" {})))
+    result))
+
 (defn solid-mesh [s]
   (when-not (watertight-solid? s) (throw (ex-info "cannot mesh non-watertight solid" {})))
   (let [triangles (mapcat (fn [face] (map #(vector (first face) (nth face %) (nth face (inc %)))
