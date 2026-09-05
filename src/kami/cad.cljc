@@ -355,7 +355,7 @@
 (defn suppress-feature [model id suppressed?]
   (update-feature model id assoc :feature/suppressed? (boolean suppressed?)))
 
-(declare extrude-polygon boolean-union boolean-difference boolean-intersect
+(declare extrude-polygon extrude-polygon-with-holes boolean-union boolean-difference boolean-intersect
          translate-solid rotate-solid mirror-solid transform-solid)
 (defn- evaluate-feature [feature inputs]
   (let [p (:feature/params feature)]
@@ -371,6 +371,7 @@
       :chamfer-sketch (chamfer-sketch (first inputs) (:corner p) (:distance p) (:start-id p) (:end-id p) (:chamfer-id p))
       :sketch->polygon (sketch-loop->polygon (first inputs) (:segments p 16))
       :extrude (extrude-polygon (first inputs) (:direction p))
+      :extrude-with-holes (extrude-polygon-with-holes (first inputs) (:holes p) (:direction p))
       ;; Boolean feature kinds always evaluate to a *vector* of 0..2 result
       ;; solids (see `boolean-union`/`boolean-difference`/`boolean-intersect`
       ;; docstrings) -- consumers that need a single mesh must pick an
@@ -954,3 +955,106 @@
         (cond-> []
           (> cut-lo lo) (conj (extrude-coaxial-solid pa (:polygon pa) lo cut-lo))
           (< cut-hi hi) (conj (extrude-coaxial-solid pa (:polygon pa) cut-hi hi)))))))
+
+;; Polygon-with-hole extrusion. The boolean-ops scope note above states the
+;; constraint this lifts: a single-loop `extrude-polygon` prism cannot
+;; represent a solid with a hole (e.g. a cartridge body pierced by a hydrogen
+;; flow channel), because the annular cap is not a simple polygon. Here the
+;; caps are triangulated annulus strips instead of claimed as one loop, which
+;; keeps every face a plain polygon and keeps `watertight-solid?` meaningful.
+;;
+;; Scope (deliberate narrow first cut, same discipline as the boolean ops):
+;;   - exactly ONE hole loop (multi-hole caps are not yet supported);
+;;   - both loops convex and planar perpendicular to the extrusion axis, and
+;;     the direction must be axis-aligned (exactly one of x/y/z nonzero);
+;;   - the hole loop must have the SAME vertex count as the outer loop, with
+;;     vertices paired by index (hole corner i against outer corner i). A
+;;     pairing whose cap strips would cross is refused loudly rather than
+;;     producing an inside-out or self-overlapping cap -- rotate the hole
+;;     loop's start index to align with the outer loop;
+;;   - every hole vertex must lie strictly inside the outer loop (outer is
+;;     convex, so this contains the whole hole);
+;;   - the result is watertight but is NOT yet a boolean-ops input
+;;     (`coaxial-prism` accepts only 2n-vertex single-loop prisms).
+(defn- planar-loop-coord [ai points]
+  (let [vals (mapv #(nth % ai) points)]
+    (when-not (apply = vals)
+      (throw (ex-info "loops must be planar perpendicular to the extrusion axis"
+                      {:axis-coords (vec (distinct vals))})))
+    (first vals)))
+
+(defn extrude-polygon-with-holes
+  "Extrude a planar convex polygon with one convex hole along an axis-aligned
+  direction into a closed watertight solid. See the scope note above this
+  definition for exactly which inputs are supported; anything else throws."
+  [points holes direction]
+  (when (every? zero? direction) (throw (ex-info "extrusion direction cannot be zero" {})))
+  (when (not= 1 (count holes))
+    (throw (ex-info "extrude-polygon-with-holes supports exactly one hole"
+                    {:holes (count holes)})))
+  (let [axis (direction-axis direction)
+        ai (get axis-index axis)
+        [i0 i1] (get plane-indices axis)
+        outer (ensure-ccw (mapv vec points))
+        hole (ensure-ccw (mapv vec (first holes)))
+        n (count outer)]
+    (when (or (< n 3) (not= n (count (distinct outer))))
+      (throw (ex-info "extrusion needs three distinct polygon points" {:points points})))
+    (when (or (< (count hole) 3) (not= (count hole) (count (distinct hole))))
+      (throw (ex-info "hole needs three distinct points" {:hole (vec (first holes))})))
+    (when-not (convex-polygon? outer) (throw (ex-info "outer loop must be convex" {:outer outer})))
+    (when-not (convex-polygon? hole) (throw (ex-info "hole loop must be convex" {:hole hole})))
+    (when (not= n (count hole))
+      (throw (ex-info "hole loop must have the same vertex count as the outer loop (index-paired cap strips)"
+                      {:outer n :hole (count hole)})))
+    (planar-loop-coord ai outer)
+    (planar-loop-coord ai hole)
+    (let [proj-outer (mapv #(vector (nth % i0) (nth % i1)) outer)
+          proj-hole (mapv #(vector (nth % i0) (nth % i1)) hole)
+          strictly-inside?
+          (fn [[u v]]
+            (every? (fn [[a b]]
+                      (let [side (- (* (- (first b) (first a)) (- v (second a)))
+                                    (* (- (second b) (second a)) (- u (first a))))]
+                        (> side boolean-eps)))
+                    (map vector proj-outer (concat (rest proj-outer) [(first proj-outer)]))))]
+      (doseq [p proj-hole]
+        (when-not (strictly-inside? p)
+          (throw (ex-info "hole must lie strictly inside the outer loop" {:point p}))))
+      (let [j (fn [i] (mod (inc i) n))
+            signed-area
+            (fn [[ax ay] [bx by] [cx cy]] (* 0.5 (- (* (- bx ax) (- cy ay)) (* (- by ay) (- cx ax)))))]
+        ;; Refuse crossed cap pairings before building anything.
+        (doseq [i (range n)]
+          (let [ji (j i)
+                o (nth proj-outer i) o' (nth proj-outer ji)
+                h (nth proj-hole i) h' (nth proj-hole ji)]
+            (when (or (<= (signed-area o o' h) boolean-eps)
+                      (<= (signed-area o' h' h) boolean-eps))
+              (throw (ex-info "hole loop pairing crosses the cap strips; rotate the hole loop's start index to align with the outer loop"
+                              {:index i})))))
+        (let [ib (fn [i] (+ (* 2 n) i))
+              it (fn [i] (+ (* 3 n) i))
+              top-tris (mapv (fn [i] (let [ji (j i)]
+                                       [[(+ n i) (+ n ji) (it i)]
+                                        [(+ n ji) (it ji) (it i)]]))
+                             (range n))
+              bottom-tris (mapv (fn [t] (mapv #(nth t %) [2 1 0]))
+                                (mapcat identity
+                                        (mapv (fn [i] (let [ji (j i)]
+                                                        [[i ji (ib i)]
+                                                         [ji (ib ji) (ib i)]]))
+                                              (range n))))
+              sides (mapv (fn [i] (let [ji (j i)] [i ji (+ n ji) (+ n i)])) (range n))
+              hole-walls (mapv (fn [i] (let [ji (j i)]
+                                         [(it i) (it ji) (ib ji) (ib i)]))
+                               (range n))
+              vertices (-> (vec points)
+                           (into (mapv #(mapv + % direction) points))
+                           (into hole)
+                           (into (mapv #(mapv + % direction) hole)))
+              result (solid vertices
+                            (vec (concat (mapcat identity top-tris) bottom-tris sides hole-walls)))]
+          (when-not (watertight-solid? result)
+            (throw (ex-info "extrusion with hole produced invalid topology" {})))
+          result)))))
