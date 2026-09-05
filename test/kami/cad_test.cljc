@@ -266,6 +266,103 @@
     (testing "and the solver does not report a converged sketch for it"
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default) (cad/solve-sketch s))))))
 
+(deftest rotation-matrix-known-angles
+  (let [m (cad/rotation-matrix [0 0 1] (/ Math/PI 2))
+        mv (fn [v] (mapv (fn [row] (reduce + (map * row v))) m))]
+    ;; (1,0,0) rotated 90deg CCW about Z is (0,1,0)
+    (is (near-point? [0.0 1.0 0.0] (mv [1 0 0])))
+    (is (near-point? [0.0 -1.0 0.0] (mv (mv [0 1 0])))))) ;; 2x90deg = 180deg
+
+;; ── rigid transforms / placement ──────────────────────────────────────────
+
+(deftest translate-and-rotate-preserve-topology-and-volume
+  (let [box (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+        moved (cad/translate-solid box [10 -5 2])
+        rot (cad/rotate-solid box [0 0 1] (* 0.5 Math/PI))]
+    (is (cad/watertight-solid? moved))
+    (is (cad/watertight-solid? rot))
+    (is (== (cad/solid-volume box) (cad/solid-volume moved)))
+    (is (== (cad/solid-volume box) (cad/solid-volume rot)))
+    ;; faces and vertex order untouched
+    (is (= (count (:solid/faces box)) (count (:solid/faces moved))))
+    (is (= (count (:solid/vertices box)) (count (:solid/vertices moved))))
+    ;; first bottom vertex translated exactly
+    (is (near-point? [10 -5 2] (nth (:solid/vertices moved) 0)))
+    ;; rotating (4,0,0) by 90deg about Z lands on (0,4,0)
+    (is (near-point? [0.0 4.0 0.0] (nth (:solid/vertices rot) 1)))))
+
+
+(deftest rotate-about-arbitrary-point-composes
+  ;; rotate 180deg about the point (2,0,0): translate·rotate·translate
+  (let [box (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+        rot (cad/rotate-solid (cad/translate-solid box [-2 0 0]) [0 0 1] Math/PI)
+        back (cad/translate-solid rot [2 0 0])
+        back (cad/translate-solid rot [2 0 0])]
+    (is (cad/watertight-solid? back))
+    (is (== (cad/solid-volume box) (cad/solid-volume back)))
+    ;; corner (0,0,0) maps to (4,0,0)
+    (is (near-point? [4.0 0.0 0.0] (nth (:solid/vertices back) 0)))))
+
+(deftest mirror-reflects-without-renumbering
+  (let [box (cad/extrude-polygon [[1 0 0] [4 0 0] [4 3 0] [1 3 0]] [0 0 2])
+        mirrored (cad/mirror-solid box :x)]
+    (is (cad/watertight-solid? mirrored))
+    (is (= (count (:solid/faces box)) (count (:solid/faces mirrored))))
+    ;; vertex 0 (1,0,0) reflects to (-1,0,0) at the SAME index
+    (is (near-point? [-1.0 0.0 0.0] (nth (:solid/vertices mirrored) 0)))
+    (is (== (cad/solid-volume box) (cad/solid-volume mirrored)))))
+
+(deftest transform-solid-composes-and-validates
+  (let [box (cad/extrude-polygon [[0 0 0] [1 0 0] [1 1 0] [0 1 0]] [0 0 1])
+        ;; uniform 2x scale then shift
+        scaled (cad/transform-solid [[2.0 0.0 0.0] [0.0 2.0 0.0] [0.0 0.0 2.0]] [1 1 1] box)]
+    (is (cad/watertight-solid? scaled))
+    (is (== 8.0 (cad/solid-volume scaled)))
+    ;; degenerate matrix collapses to a plane -> refused loudly
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/transform-solid [[1.0 0.0 0.0] [1.0 0.0 0.0] [0.0 0.0 1.0]] [0 0 0] box)))
+    ;; malformed inputs refused
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/transform-solid [[1 0] [0 1]] [0 0 0] box)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/translate-solid box [1 0])))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/rotate-solid box [0 0 0] 1.0)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/mirror-solid box :w)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/translate-solid (cad/solid [[0 0 0] [1 0 0] [0 1 0]] [[0 1 2]]) [1 0 0])))))
+
+(deftest placement-participates-in-feature-tree
+  (let [model (cad/feature-model
+               [(cad/feature :box :extrude [] {:direction [0 0 2]})
+                (cad/feature :poly :sketch->polygon [] {:value nil})
+                ;; build box directly from a source polygon then translate it
+                (cad/feature :src-poly :source [] {:value [[0 0 0] [4 0 0] [4 3 0] [0 3 0]]})
+                (cad/feature :box2 :extrude [:src-poly] {:direction [0 0 2]})
+                (cad/place-feature :placed :translate-solid :box2 {:delta [10 0 0]})
+                (cad/place-feature :rotated :rotate-solid :placed {:axis [0 0 1] :radians Math/PI})])
+        results (cad/recompute-feature-model model)]
+    (is (= :ok (get-in results [:feature-model/statuses :placed :status])))
+    (is (= :ok (get-in results [:feature-model/statuses :rotated :status])))
+    (let [placed (get-in results [:feature-model/results :placed])
+          rotated (get-in results [:feature-model/results :rotated])]
+      (is (near-point? [10.0 0.0 0.0] (nth (:solid/vertices placed) 0)))
+      ;; rotated 180deg about origin: (10,0,0) -> (-10,0,0)
+      (is (near-point? [-10.0 0.0 0.0] (nth (:solid/vertices rotated) 0)))
+      (is (== (cad/solid-volume (get-in results [:feature-model/results :box2]))
+              (cad/solid-volume rotated))))
+    ;; unknown placement kind refused at construction
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (cad/place-feature :p :scale-solid :box2 {:delta [1 0 0]})))
+    ;; mirror placement kind round-trips through the tree too
+    (let [m2 (cad/feature-model
+              [(cad/feature :src-poly :source [] {:value [[1 0 0] [4 0 0] [4 3 0] [1 3 0]]})
+               (cad/feature :box2 :extrude [:src-poly] {:direction [0 0 2]})
+               (cad/place-feature :mirrored :mirror-solid :box2 {:axis :x})])
+          r2 (cad/recompute-feature-model m2)]
+      (is (= :ok (get-in r2 [:feature-model/statuses :mirrored :status])))
+      (is (near-point? [-1.0 0.0 0.0] (nth (:solid/vertices (get-in r2 [:feature-model/results :mirrored])) 0))))))
 (deftest revolve-cylinder-closed-by-two-apexes
   (let [s (cad/revolve [[0 0 0] [1 0 0] [1 0 2] [0 0 2]] 4)]
     (is (cad/watertight-solid? s))

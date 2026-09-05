@@ -355,7 +355,8 @@
 (defn suppress-feature [model id suppressed?]
   (update-feature model id assoc :feature/suppressed? (boolean suppressed?)))
 
-(declare extrude-polygon boolean-union boolean-difference boolean-intersect)
+(declare extrude-polygon boolean-union boolean-difference boolean-intersect
+         translate-solid rotate-solid mirror-solid transform-solid)
 (defn- evaluate-feature [feature inputs]
   (let [p (:feature/params feature)]
     (case (:feature/kind feature)
@@ -377,6 +378,12 @@
       :boolean-union (boolean-union (first inputs) (second inputs))
       :boolean-difference (boolean-difference (first inputs) (second inputs))
       :boolean-intersect (boolean-intersect (first inputs) (second inputs))
+      ;; Placement features re-place an earlier solid (see translate-solid
+      ;; et al. below): params are consumed exactly as the standalone fns.
+      :translate-solid (translate-solid (first inputs) (:delta p))
+      :rotate-solid (rotate-solid (first inputs) (:axis p) (:radians p))
+      :mirror-solid (mirror-solid (first inputs) (:axis p))
+      :transform-solid (transform-solid (:matrix p) (:delta p) (first inputs))
       (throw (ex-info "unsupported CAD feature" {:kind (:feature/kind feature)})))))
 
 (defn recompute-feature-model
@@ -802,6 +809,131 @@
           gap? (> (max (:lo pa) (:lo pb)) (min (:hi pa) (:hi pb)))]
       (if gap? [a b] [(extrude-coaxial-solid pa (:polygon pa) lo hi)]))))
 
+
+;; Rigid transforms: translate / rotate (axis-angle, Rodrigues) / mirror.
+;;
+;; Every solid generator in this engine (`extrude-polygon`, `revolve`,
+;; boolean rebuilds) emits vertices in a caller-chosen frame, but nothing
+;; on main can MOVE a solid afterwards: a packaging designer composing the
+;; replaceable Mg/MgH2 cartridge inside the vehicle envelope, or stacking
+;; cartridge variants along a rail, must currently regenerate each solid
+;; with hand-shifted input coordinates — duplicating the generator's
+;; validation and pinning discretisation choices into placement code.
+;;
+;; These are exact vertex maps on watertight `:cad/kind :solid` values.
+;; They preserve topology (vertex order, faces, edge incidence), so the
+;; result stays watertight and every downstream consumer (`solid-mesh`,
+;; `solid-volume`, `bounds`) behaves identically. No units, no material
+;; constants — pure geometry. Translation is caller-supplied in the
+;; caller's units; rotation is an exact rotation matrix; mirror never
+;; re-numbers vertices, it only reflects their coordinates.
+;;
+;; Fails closed with ex-info on: non-watertight input, malformed
+;; vectors, zero rotation axis, non-unit or zero scale, and axis
+;; components outside {-1, +1}.
+
+(defn- v3? [v] (and (vector? v) (= 3 (count v)) (every? number? v)))
+
+(defn translate-solid
+  "Rigidly translate a watertight solid by vector `delta` (same units as
+  the solid's own coordinates). Topology is preserved exactly; only
+  `:solid/vertices` change."
+  [s delta]
+  (when-not (watertight-solid? s) (throw (ex-info "translate-solid needs a watertight solid" {})))
+  (when-not (v3? delta) (throw (ex-info "translate-solid needs a 3D numeric translation vector" {:delta delta})))
+  (update s :solid/vertices (fn [vs] (mapv (fn [p] (mapv + p delta)) vs))))
+
+(def ^:private identity-matrix [[1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]])
+
+(defn- mat-vec [m v]
+  (mapv (fn [row] (reduce + (map * row v))) m))
+
+(defn- mat-mat [a b]
+  (mapv (fn [row] (mapv (fn [col] (reduce + (map * row col))) (apply mapv vector b))) a))
+
+(defn rotation-matrix
+  "3x3 rotation matrix for `axis` (3D vector, must be nonzero) rotated by
+  `radians` (radians, CCW when the axis points at the viewer) — exact
+  Rodrigues construction, purely from the caller's inputs."
+  [axis radians]
+  (when-not (v3? axis) (throw (ex-info "rotation-matrix needs a 3D numeric axis" {:axis axis})))
+  (let [len (#?(:clj Math/sqrt :cljs js/Math.sqrt) (reduce + (map #(* % %) axis)))]
+    (when (< len 1.0e-12) (throw (ex-info "rotation-matrix needs a nonzero axis" {:axis axis})))
+    (let [[ux uy uz] (mapv #(/ % len) axis)
+          c (#?(:clj Math/cos :cljs js/Math.cos) radians)
+          s (#?(:clj Math/sin :cljs js/Math.sin) radians)
+          cc (- 1.0 c)]
+      [[(+ c (* ux ux cc)) (- (* ux uy cc) (* uz s)) (+ (* ux uz cc) (* uy s))]
+       [(+ (* uy ux cc) (* uz s)) (+ c (* uy uy cc)) (- (* uy uz cc) (* ux s))]
+       [(- (* uz ux cc) (* uy s)) (+ (* uz uy cc) (* ux s)) (+ c (* uz uz cc))]])))
+
+(defn rotate-solid
+  "Rigidly rotate a watertight solid about the world origin by an
+  axis-angle pair. The axis is normalised internally; topology and
+  vertex order are preserved exactly."
+  [s axis radians]
+  (when-not (watertight-solid? s) (throw (ex-info "rotate-solid needs a watertight solid" {})))
+  (let [m (rotation-matrix axis radians)]
+    (update s :solid/vertices (fn [vs] (mapv (fn [p] (mat-vec m p)) vs)))))
+
+(defn- mirror-matrix [axis]
+  (when-not (#{:x :y :z} axis) (throw (ex-info "mirror-solid needs an axis in #{:x :y :z}" {:axis axis})))
+  (let [idx (get {:x 0 :y 1 :z 2} axis)]
+    (mapv (fn [i] (mapv (fn [j] (if (= i j) (if (= i idx) -1.0 1.0) 0.0)) (range 3))) (range 3))))
+
+(defn mirror-solid
+  "Mirror a watertight solid across the plane x=0 (`:x`), y=0 (`:y`), or
+  z=0 (`:z`). Coordinates are reflected; vertex order, faces and edge
+  incidence are untouched, so watertightness is preserved exactly.
+
+  Disclosed geometric caveat: reflection flips orientation. This
+  engine's watertightness check is incidence-only and stays valid, but
+  downstream consumers that assume outward-facing (CCW) face winding
+  must reorient the result themselves — mirroring never re-numbers
+  vertices, so no silent winding fix is applied here."
+  [s axis]
+  (when-not (watertight-solid? s) (throw (ex-info "mirror-solid needs a watertight solid" {})))
+  (let [m (mirror-matrix axis)]
+    (update s :solid/vertices (fn [vs] (mapv (fn [p] (mat-vec m p)) vs)))))
+
+(defn transform-solid
+  "Apply an explicit 3x3 matrix `m` followed by translation `delta` to a
+  watertight solid — the escape hatch for composite frames (rotate about
+  an arbitrary point = translate·rotate·translate, scale via a diagonal
+  matrix). The caller owns every numeric entry; nothing is normalised.
+  A zero-determinant matrix silently collapses the solid to a plane, so
+  the result's watertightness is asserted before returning (same
+  discipline as `extrude-polygon`)."
+  [m delta s]
+  (when-not (watertight-solid? s) (throw (ex-info "transform-solid needs a watertight solid" {})))
+  (when-not (and (vector? m) (= 3 (count m)) (every? v3? m))
+    (throw (ex-info "transform-solid needs a 3x3 numeric matrix" {:matrix m})))
+  (when-not (v3? delta) (throw (ex-info "transform-solid needs a 3D numeric translation vector" {:delta delta})))
+  (let [det (- (* (nth (nth m 0) 0) (- (* (nth (nth m 1) 1) (nth (nth m 2) 2)) (* (nth (nth m 1) 2) (nth (nth m 2) 1))))
+               (* (nth (nth m 0) 1) (- (* (nth (nth m 1) 2) (nth (nth m 2) 0)) (* (nth (nth m 1) 0) (nth (nth m 2) 2))))
+               (* (nth (nth m 0) 2) (- (* (nth (nth m 1) 0) (nth (nth m 2) 1)) (* (nth (nth m 1) 1) (nth (nth m 2) 0)))))
+        result (update s :solid/vertices (fn [vs] (mapv (fn [p] (mapv + (mat-vec m p) delta)) vs)))]
+    (when (< (#?(:clj Math/abs :cljs js/Math.abs) det) 1.0e-12)
+      (throw (ex-info "transform-solid matrix is singular (zero determinant)" {:det det})))
+    (when-not (watertight-solid? result) (throw (ex-info "transform-solid produced invalid topology" {})))
+    result))
+
+;; Placement is a parametric feature kind: `:translate-solid`,
+;; `:rotate-solid`, `:mirror-solid` and `:transform-solid` all take the
+;; solid produced by an earlier feature (:extrude, :revolve, boolean…)
+;; and re-place it, so a packaging study can move the cartridge without
+;; re-declaring its generating geometry. Params are echoed verbatim by
+;; `evaluate-feature`.
+(defn place-feature
+  "Ordered-feature-tree node that re-places an earlier solid feature.
+  `kind` is one of :translate-solid / :rotate-solid / :mirror-solid /
+  :transform-solid; `params` carries the exact motion parameters
+  (:delta, :axis, :radians, :matrix) consumed by `evaluate-feature`."
+  ([id kind input-id params] (place-feature id kind input-id params false))
+  ([id kind input-id params suppressed?]
+   (when-not (#{:translate-solid :rotate-solid :mirror-solid :transform-solid} kind)
+     (throw (ex-info "place-feature needs a placement kind" {:kind kind})))
+   (feature id kind [input-id] params suppressed?)))
 (defn boolean-difference
   "Solid difference A − B, scoped to solids sharing an identical
   cross-section profile (see scope note above): subtracts B's axis
