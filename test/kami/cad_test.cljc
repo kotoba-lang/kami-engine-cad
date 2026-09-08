@@ -517,3 +517,71 @@
                  (cad/boolean-union s
                                     (cad/extrude-polygon [[0 0 0] [1 0 0] [1 1 0] [0 1 0]]
                                                          [0 0 1]))))))
+
+(deftest solid-mass-properties-verified-against-analytic-box
+  ;; Solid box 4x3x2: volume 24, centroid [2 1.5 1], inertia about centroid
+  ;; = V/12 · (ly²+lz², lx²+lz², lx²+ly²) = 2·(13, 20, 25).
+  (let [mp (cad/solid-mass-properties (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2]))]
+    (is (== 24.0 (:volume mp)))
+    (is (near-point? [2.0 1.5 1.0] (:centroid mp)))
+    (let [ic (:inertia-about-centroid mp)]
+      ;; diagonal dominant; off-diagonals ~0 for a box centered at its own centroid
+      (is (near-point? [26.0 40.0 50.0]
+                       [(get-in ic [0 0]) (get-in ic [1 1]) (get-in ic [2 2])]))
+      (is (every? #(< (#?(:clj Math/abs :cljs js/Math.abs) %) 1.0e-9)
+                  [(get-in ic [0 1]) (get-in ic [0 2]) (get-in ic [1 2])])))))
+
+(deftest solid-mass-properties-volume-consistent-with-solid-volume
+  (let [s (cad/extrude-polygon [[0 0 0] [6 0 0] [6 4 0] [0 4 0]] [0 0 3])
+        mp (cad/solid-mass-properties s)]
+    (is (== (cad/solid-volume s) (:volume mp)))
+    (is (== 72.0 (:volume mp)))
+    (is (near-point? [3.0 2.0 1.5] (:centroid mp)))))
+
+(deftest solid-mass-properties-translation-moves-centroid
+  ;; Translating a solid rigidly must shift the centroid by the same vector
+  ;; and preserve volume and centroid-inertia (a rigid body's own inertia
+  ;; tensor is translation-invariant).
+  (let [ms (cad/solid-mass-properties (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2]))
+        mt (cad/solid-mass-properties (cad/translate-solid
+                                       (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+                                       [10 -5 2]))]
+    (is (near-point? (map + (:centroid ms) [10 -5 2]) (:centroid mt)))
+    (is (< (#?(:clj Math/abs :cljs js/Math.abs) (- (:volume ms) (:volume mt))) 1.0e-9))
+    (is (every? true? (map (fn [r1 r2]
+                             (every? true? (map (fn [x y]
+                                                  (< (#?(:clj Math/abs :cljs js/Math.abs) (- x y)) 1.0e-9))
+                                                r1 r2)))
+                           (:inertia-about-centroid ms) (:inertia-about-centroid mt))))))
+
+(deftest solid-mass-properties-annulus-centroid-and-volume
+  ;; 4x4x2 outer minus centered 2x2x2 hole -> volume 24, centroid [2 2 1]
+  ;; (the cartridge-body shape from the established annulus tests).
+  (let [s (cad/extrude-polygon-with-holes [[0 0 0] [4 0 0] [4 4 0] [0 4 0]]
+                                          [[[1 1 0] [3 1 0] [3 3 0] [1 3 0]]]
+                                          [0 0 2])
+        mp (cad/solid-mass-properties s)]
+    (is (== 24.0 (:volume mp)))
+    (is (near-point? [2.0 2.0 1.0] (:centroid mp)))))
+
+(deftest solid-mass-properties-orientation-independent
+  ;; Mirrored box flips winding without renumbering vertices; the centroid
+  ;; reflects but the volume and centroid-inertia tensor are unchanged and
+  ;; the centroid-relative inertia is mirror-invariant. Orientation is
+  ;; normalized, never assumed.
+  (let [box (cad/extrude-polygon [[0 0 0] [4 0 0] [4 3 0] [0 3 0]] [0 0 2])
+        mir (cad/mirror-solid box :x)
+        mb (cad/solid-mass-properties box)
+        mm (cad/solid-mass-properties mir)]
+    (is (== (:volume mb) (:volume mm)))
+    ;; mirror of [2 1.5 1] across x=0 is [-2 1.5 1]
+    (is (near-point? [-2.0 1.5 1.0] (:centroid mm)))
+    (is (every? true? (map (fn [r1 r2]
+                             (every? true? (map (fn [x y]
+                                                  (< (#?(:clj Math/abs :cljs js/Math.abs) (- x y)) 1.0e-9))
+                                                r1 r2)))
+                           (:inertia-about-centroid mb) (:inertia-about-centroid mm))))))
+
+(deftest solid-mass-properties-refuses-bad-input
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (cad/solid-mass-properties (cad/solid [[0 0 0] [1 0 0] [0 1 0]] [[0 1 2]])))))

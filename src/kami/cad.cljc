@@ -1058,3 +1058,101 @@
           (when-not (watertight-solid? result)
             (throw (ex-info "extrusion with hole produced invalid topology" {})))
           result)))))
+
+;; ── solid mass properties (centroid + inertia) ──────────────────────────
+
+(defn- v3-dot [u v] (reduce + 0.0 (map * u v)))
+
+(defn- v3-cross [u v]
+  [(- (* (nth u 1) (nth v 2)) (* (nth u 2) (nth v 1)))
+   (- (* (nth u 2) (nth v 0)) (* (nth u 0) (nth v 2)))
+   (- (* (nth u 0) (nth v 1)) (* (nth u 1) (nth v 0)))])
+
+(defn solid-mass-properties
+  "Geometric centroid and inertia (second-moment) tensor of a watertight
+  solid, computed exactly from its triangulated boundary mesh
+  (`solid-mesh`) by summing oriented tetrahedra from the origin.
+
+  This is the smallest CAE-facing addition to the parametric 3D layer: the
+  engine already builds solids (`extrude-polygon`, `revolve`, annulus
+  extrusion, booleans), measures them (`solid-volume`, `bounds`), and
+  places them (`translate-solid`, `rotate-solid`, ...), but nothing on main
+  turns a measured solid into the mass-location / inertia inputs a
+  structural or dynamic CAE consumer needs. Without it a packaging
+  engineer placing the replaceable Mg/MgH2 cartridge inside the load-bearing
+  magnesium structure, or a dynamics engineer who needs a body's moment of
+  inertia, must re-triangulate the same mesh by hand and re-derive its
+  orientation convention — the exact duplication this contract removes.
+
+  The math is pure geometry — no material, density, or performance constant
+  is invented here (the system scope forbids inventing those). All results
+  are at UNIT density; a caller with a measured density multiplies the
+  reported values themselves. The basis is the solid's own vertex frame, so
+  the result is neutral-data-first and moves with the same rigid transforms
+  the rest of the engine applies. Orientation is never assumed: the signed
+  tetrahedron sum is normalized so the reported volume is positive, so an
+  inward- or outward-wound mesh yields the identical centroid and inertia.
+
+  Per boundary triangle (a, b, c), the oriented tetrahedron (0, a, b, c):
+    Vt  = det(a,b,c)/6                  (oriented volume)
+    sa  = a + b + c                     (vertex sum)
+    ∫ x dV  = Vt · sa/4                 (centroid contribution)
+    ∫x_i x_j dV = Vt/20 · ((a_i a_j + b_i b_j + c_i c_j) + sa_i·sa_j)
+  These are the exact simplex integrals (verified against the unit
+  tetrahedron), so a solid is integrated precisely, never sampled.
+
+  Returns {:volume (== `solid-volume`, positive)
+           :centroid  [x y z]
+           :inertia-about-origin    3x3 matrix about the world origin
+           :inertia-about-centroid  3x3 tensor about the centroid
+                                    (parallel-axis reduced)}
+  all at unit density. Refuses a non-watertight or zero-volume solid."
+  [s]
+  (when-not (watertight-solid? s)
+    (throw (ex-info "solid-mass-properties needs a watertight solid" {})))
+  (let [{:keys [positions indices]} (solid-mesh s)
+        ;; state = [V m0 m1 m2  S00 S01 S02  S10 S11 S12  S20 S21 S22]
+        init (vec (repeat 13 0.0))
+        step (fn [st [ai bi ci]]
+               (let [a (nth positions ai)
+                     b (nth positions bi)
+                     c (nth positions ci)
+                     vt (double (/ (v3-dot a (v3-cross b c)) 6.0))
+                     sa (mapv (fn [i] (+ (nth a i) (nth b i) (nth c i))) (range 3))
+                     d  (fn [i j] (+ (* (nth a i) (nth a j))
+                                     (* (nth b i) (nth b j))
+                                     (* (nth c i) (nth c j))))
+                     acc (fn [i j] (* vt (/ (+ (d i j) (* (nth sa i) (nth sa j))) 20.0)))]
+                 [(+ (nth st 0) vt)
+                  (+ (nth st 1) (* vt (nth sa 0) 0.25)) (+ (nth st 2) (* vt (nth sa 1) 0.25)) (+ (nth st 3) (* vt (nth sa 2) 0.25))
+                  (+ (nth st 4)  (acc 0 0)) (+ (nth st 5)  (acc 0 1)) (+ (nth st 6)  (acc 0 2))
+                  (+ (nth st 7)  (acc 1 0)) (+ (nth st 8)  (acc 1 1)) (+ (nth st 9)  (acc 1 2))
+                  (+ (nth st 10) (acc 2 0)) (+ (nth st 11) (acc 2 1)) (+ (nth st 12) (acc 2 2))]))
+        raw (reduce step init (partition 3 indices))
+        sgn (if (neg? (double (nth raw 0))) -1.0 1.0)
+        st  (mapv #(* sgn %) raw)
+        V   (nth st 0)
+        m   (mapv (fn [i] (nth st (inc i))) (range 3))
+        S   (mapv (fn [i] (mapv (fn [j] (nth st (+ 4 (* i 3) j))) (range 3))) (range 3))]
+    (when-not (pos? (double V))
+      (throw (ex-info "solid-mass-properties: zero-volume solid" {:volume V})))
+    (let [centroid (mapv double (mapv #(/ % V) m))
+          tr  (reduce + (mapv (fn [i] (get-in S [i i])) (range 3)))
+          ;; inertia about origin I = tr(S)·I3 − S
+          io  (mapv (fn [i]
+                      (mapv (fn [j] (if (= i j) (- tr (get-in S [i i])) (- (get-in S [i j]))))
+                            (range 3)))
+                    (range 3))
+          ;; parallel-axis to centroid: I^c = I^o − V(‖c‖²·I3 − c⊗c)
+          c2  (reduce + (map #(* % %) centroid))
+          ic  (mapv (fn [i]
+                      (mapv (fn [j]
+                              (let [off (* V (nth centroid i) (nth centroid j))]
+                                (if (= i j) (- (get-in io [i i]) (- (* V c2) off))
+                                  (+ (get-in io [i j]) off))))
+                            (range 3)))
+                    (range 3))]
+      {:volume (double V)
+       :centroid centroid
+       :inertia-about-origin (mapv (fn [r] (mapv double r)) io)
+       :inertia-about-centroid (mapv (fn [r] (mapv double r)) ic)})))
