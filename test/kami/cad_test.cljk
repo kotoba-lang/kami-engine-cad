@@ -1,4 +1,4 @@
-(ns kami.cad-test (:require [clojure.test :refer [deftest is testing]] [kami.cad :as cad]))
+(ns kami.cad-test (:require [kotoba.test :refer [deftest is testing]] [kami.cad :as cad]))
 (defn close-point? [a b]
   (every? true? (map #(< (#?(:clj Math/abs :cljs js/Math.abs) (- %1 %2)) 1.0e-10) a b)))
 (defn near-point? [a b]
